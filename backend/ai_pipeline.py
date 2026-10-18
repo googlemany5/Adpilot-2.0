@@ -40,9 +40,22 @@ def run_ai_pipeline(
     )
 
     allocations = optimization.get(
-        "allocations",
+        "final_allocations",
         [],
     )
+
+    # The optimizer uses recommended_budget; the safety controller
+    # accepts budget. Normalize the shape before validation.
+    allocations = [
+        {
+            **allocation,
+            "budget": allocation.get(
+                "budget",
+                allocation.get("recommended_budget", 0),
+            ),
+        }
+        for allocation in allocations
+    ]
 
     safety_result = validate_allocation_batch(
         db=db,

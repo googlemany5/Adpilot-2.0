@@ -1,3 +1,4 @@
+import math
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -6,6 +7,7 @@ from database import CampaignDB
 from safety import (
     validate_spend,
     get_safety_summary,
+    MAX_SINGLE_ALLOCATION_PERCENT,
 )
 
 
@@ -208,24 +210,65 @@ def validate_allocation_batch(
     total_requested = 0.0
     total_approved = 0.0
 
+    # Reserve capacity within this batch without recording spending.
+    # Each subsequent request sees less available capacity.
+    summary = get_safety_summary(campaign)
+    remaining_today = float(summary["remaining_today"])
+    remaining_month = float(summary["remaining_this_month"])
+    remaining_discovery = float(summary["discovery_remaining"])
+
+    # Each decision is limited to the configured percentage of
+    # the daily budget remaining when this batch started.
+    batch_single_allocation_limit = (
+        remaining_today * MAX_SINGLE_ALLOCATION_PERCENT
+    )
+
     for allocation in allocations:
 
-        requested = float(
-            allocation.get(
-                "budget",
-                0,
-            )
-        )
+        try:
+            requested = float(allocation.get("budget", 0))
+        except (TypeError, ValueError, OverflowError):
+            requested = 0.0
 
+        # Never allow NaN, infinity, or negative amounts to
+        # corrupt the batch's reported requested total.
+        if not math.isfinite(requested):
+            requested = 0.0
+
+        requested = max(requested, 0.0)
         total_requested += requested
 
-        result = controller.build_execution_request(
-            allocation
+        spending_type = allocation.get("spending_type", "normal")
+        available = min(remaining_today, remaining_month)
+
+        if spending_type == "discovery":
+            available = min(available, remaining_discovery)
+
+        # Clamp each request to the remaining batch capacity.
+        bounded = dict(allocation)
+        bounded["budget"] = min(
+            requested,
+            max(available, 0.0),
+            max(batch_single_allocation_limit, 0.0),
         )
 
-        total_approved += result[
-            "approved_budget"
-        ]
+        result = controller.build_execution_request(bounded)
+
+        # Preserve the original request for transparent reporting.
+        result["requested_budget"] = round(requested, 2)
+
+        approved_amount = result["approved_budget"]
+        total_approved += approved_amount
+
+        if result["approved"]:
+            remaining_today = max(0.0, remaining_today - approved_amount)
+            remaining_month = max(0.0, remaining_month - approved_amount)
+
+            if spending_type == "discovery":
+                remaining_discovery = max(
+                    0.0,
+                    remaining_discovery - approved_amount,
+                )
 
         results.append(result)
 
