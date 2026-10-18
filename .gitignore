@@ -1,0 +1,26 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets and environment variables
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+
+# Backups and temporary recovery files
+*.backup
+*.backup_*
+*.before_error_fixes
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
