@@ -1685,6 +1685,12 @@ def platform_execute(
             detail="Campaign not found",
         )
 
+    if campaign.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail="Campaign must be active before platform execution.",
+        )
+
     executor = PlatformExecutor(
         db=db,
         campaign=campaign,
