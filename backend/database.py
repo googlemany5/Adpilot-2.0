@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Text,
+    inspect,
 )
 
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -338,6 +339,17 @@ class DiscountRedemptionDB(Base):
 # SUBSCRIPTIONS
 # ============================================================
 
+class ProcessedStripeEventDB(Base):
+    """Stripe webhook event IDs already handled by AdPilot."""
+
+    __tablename__ = "processed_stripe_events"
+
+    event_id = Column(String, primary_key=True)
+    event_type = Column(String, nullable=False)
+    event_created = Column(Integer, nullable=False)
+    processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class SubscriptionDB(Base):
     __tablename__ = "subscriptions"
 
@@ -352,12 +364,12 @@ class SubscriptionDB(Base):
 
     plan = Column(
         String,
-        default="free",
+        default="none",
     )
 
     status = Column(
         String,
-        default="active",
+        default="pending",
     )
 
     stripe_customer_id = Column(
@@ -369,6 +381,8 @@ class SubscriptionDB(Base):
         String,
         nullable=True,
     )
+
+    last_stripe_event_created = Column(Integer, nullable=True)
 
     current_period_start = Column(
         DateTime,
@@ -464,7 +478,7 @@ class PlatformConnectionDB(Base):
 
     is_active = Column(
         Boolean,
-        default=True,
+        default=False,
     )
 
     connected_at = Column(
@@ -474,6 +488,17 @@ class PlatformConnectionDB(Base):
 
 
 # ============================================================
+class PlatformOAuthStateDB(Base):
+    __tablename__ = "platform_oauth_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    state_hash = Column(String, nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    platform = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+
+
 # ADVERTISEMENTS
 # ============================================================
 
@@ -513,3 +538,16 @@ class AdvertisementDB(Base):
 # ============================================================
 
 Base.metadata.create_all(bind=engine)
+
+# Safely add the timestamp column to existing SQLite databases.
+if engine.dialect.name == "sqlite":
+    columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("subscriptions")
+    }
+    if "last_stripe_event_created" not in columns:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE subscriptions "
+                "ADD COLUMN last_stripe_event_created INTEGER"
+            )

@@ -178,6 +178,26 @@ r = requests.post(
 )
 show("RESUME CAMPAIGN", r)
 
+# Safe spend after resume: should succeed only if campaign is active
+r = requests.post(
+    f"{BASE}/campaigns/{campaign_id}/safe-spend",
+    headers=headers,
+    params={
+        "amount": 25,
+        "platform": "meta",
+        "country": "United States",
+        "spending_type": "normal",
+    },
+)
+show("SAFE SPEND AFTER RESUME", r)
+
+# Verify recorded spending after the successful attempt
+r = requests.get(
+    f"{BASE}/campaigns/{campaign_id}/safety",
+    headers=headers,
+)
+show("SAFETY AFTER ACTIVE SPEND", r)
+
 # Platform status
 r = requests.get(
     f"{BASE}/platforms/status",

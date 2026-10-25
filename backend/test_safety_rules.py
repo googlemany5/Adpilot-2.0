@@ -117,6 +117,14 @@ tests = [
         "Allocation is too large for a single decision.",
     ),
     (
+        "Invalid spending type rejected",
+        fake_campaign(),
+        10,
+        "discover",
+        False,
+        "Invalid spending type.",
+    ),
+    (
         "Valid normal request approved",
         fake_campaign(),
         25,

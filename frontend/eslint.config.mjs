@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    "dashboard-backup-*/**",
+    "dashboard-before-budget-upgrade-*/**",
   ]),
 ]);
 

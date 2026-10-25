@@ -1,63 +1,56 @@
+import secrets
+import uuid
+
 import requests
-from getpass import getpass
 
 BASE = "http://127.0.0.1:8000"
-EMAIL = "test@adpilot.ai"
 
-password = getpass("Test account password: ")
 
-# Log in
-login = requests.post(
-    f"{BASE}/auth/login",
-    data={"username": EMAIL, "password": password},
-    timeout=15,
-)
-print("\nLOGIN:", login.status_code)
-login.raise_for_status()
+def test_campaigns_endpoint():
+    email = f"campaign-test-{uuid.uuid4().hex}@example.com"
+    password = secrets.token_urlsafe(24)
 
-token = login.json().get("access_token")
-if not token:
-    print("Login response:", login.json())
-    raise SystemExit("No access token returned.")
-
-headers = {"Authorization": f"Bearer {token}"}
-
-# Fetch campaigns
-response = requests.get(
-    f"{BASE}/campaigns",
-    headers=headers,
-    timeout=15,
-)
-print("CAMPAIGNS:", response.status_code)
-response.raise_for_status()
-
-data = response.json()
-campaigns = data if isinstance(data, list) else data.get("campaigns", [])
-
-print("\nYour campaigns:")
-for campaign in campaigns:
-    print(
-        f"ID {campaign.get('id')}: "
-        f"{campaign.get('name', 'Unnamed')} — "
-        f"{campaign.get('status', 'unknown')}"
+    registration = requests.post(
+        f"{BASE}/auth/register",
+        json={
+            "email": email,
+            "password": password,
+            "first_name": "Campaign",
+            "last_name": "Test",
+        },
+        timeout=15,
+    )
+    assert registration.status_code in (200, 201), (
+        f"Registration failed: HTTP {registration.status_code}"
     )
 
-# Select a campaign
-campaign_id = input("\\nEnter the ID of your test campaign: ").strip()
+    login = requests.post(
+        f"{BASE}/auth/login",
+        data={"username": email, "password": password},
+        timeout=15,
+    )
+    assert login.status_code == 200, (
+        f"Login failed: HTTP {login.status_code}"
+    )
 
-if not campaign_id.isdigit():
-    raise SystemExit("Please enter a numeric campaign ID.")
+    token = login.json().get("access_token")
+    assert token, "Login response did not contain an access token."
 
-selected = next(
-    (c for c in campaigns if c.get("id") == int(campaign_id)),
-    None,
-)
+    response = requests.get(
+        f"{BASE}/campaigns",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    assert response.status_code == 200, (
+        f"Campaign request failed: HTTP {response.status_code}"
+    )
 
-if selected is None:
-    raise SystemExit("That campaign ID was not found.")
+    data = response.json()
+    campaigns = (
+        data if isinstance(data, list) else data.get("campaigns", [])
+    )
+    assert isinstance(campaigns, list), (
+        "Expected campaigns endpoint to return a list."
+    )
 
-print("\nSelected campaign:")
-print("ID:", selected.get("id"))
-print("Name:", selected.get("name"))
-print("Status:", selected.get("status"))
-print("\nTEST COMPLETE — no campaign settings were changed.")
+    print(f"\nCampaign endpoint passed; found {len(campaigns)} campaigns.")

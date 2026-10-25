@@ -10,10 +10,24 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, UserDB
 
 
-SECRET_KEY = os.getenv(
-    "ADPILOT_SECRET_KEY",
-    "CHANGE_THIS_SECRET_KEY_BEFORE_PRODUCTION",
-)
+_DEVELOPMENT_SECRET = "CHANGE_THIS_SECRET_KEY_BEFORE_PRODUCTION"
+
+_ENVIRONMENT = os.getenv(
+    "ADPILOT_ENVIRONMENT", "development"
+).strip().lower()
+
+_configured_secret = os.getenv("ADPILOT_SECRET_KEY")
+
+if _ENVIRONMENT == "production":
+    if (
+        not _configured_secret
+        or _configured_secret == _DEVELOPMENT_SECRET
+    ):
+        raise RuntimeError(
+            "Production requires a unique ADPILOT_SECRET_KEY."
+        )
+
+SECRET_KEY = _configured_secret or _DEVELOPMENT_SECRET
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24

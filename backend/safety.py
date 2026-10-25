@@ -120,6 +120,9 @@ def validate_spend(
     ):
         return False, "Spend amount must be a finite number."
 
+    if spending_type not in {"normal", "discovery"}:
+        return False, "Invalid spending type."
+
     if amount <= 0:
         return False, "Spend amount must be greater than zero."
 

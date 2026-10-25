@@ -1,3 +1,8 @@
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / '.env', override=False)
+
 from datetime import datetime, date
 from typing import Optional
 
@@ -36,6 +41,12 @@ from auth import (
     require_admin,
 )
 
+from token_crypto import encrypt_token
+from billing import router as billing_router
+from plan_config import get_campaign_limit
+from platform_oauth import router as platform_oauth_router
+from account_discovery import router as account_discovery_router
+
 
 # ============================================================
 # DATABASE
@@ -54,6 +65,10 @@ app = FastAPI(
     version="2.0.0",
 )
 
+app.include_router(billing_router)
+app.include_router(platform_oauth_router)
+app.include_router(account_discovery_router)
+
 
 # ============================================================
 # GENERAL
@@ -65,7 +80,7 @@ from safety import (
     pause_campaign,
     resume_campaign,
     emergency_pause_campaign,
-    record_spend,
+    record_spend as safety_record_spend,
 )
 
 from budget_controller import (
@@ -173,8 +188,8 @@ def register(
 
     subscription = SubscriptionDB(
         user_id=user.id,
-        plan="free",
-        status="active",
+        plan="none",
+        status="pending",
     )
 
     db.add(subscription)
@@ -269,6 +284,40 @@ def create_campaign(
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    subscription = (
+        db.query(SubscriptionDB)
+        .filter(SubscriptionDB.user_id == current_user.id)
+        .first()
+    )
+
+    campaign_limit = (
+        get_campaign_limit(subscription.plan)
+        if subscription is not None
+        and subscription.status == "active"
+        else None
+    )
+
+    if campaign_limit is None:
+        raise HTTPException(
+            status_code=402,
+            detail="An active paid AdPilot subscription is required to create campaigns.",
+        )
+
+    campaign_count = (
+        db.query(CampaignDB)
+        .filter(CampaignDB.user_id == current_user.id)
+        .count()
+    )
+
+    if campaign_count >= campaign_limit:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Your {subscription.plan.title()} plan allows "
+                f"up to {campaign_limit} campaigns. Upgrade your plan to create more."
+            ),
+        )
+
     campaign = CampaignDB(
         user_id=current_user.id,
         name=campaign_data.name,
@@ -817,12 +866,39 @@ def create_platform_connection(
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # Normalize supported platform names to a consistent value.
+    platform_input = data.platform.strip().lower()
+    platform_aliases = {
+        "google": "google",
+        "google_ads": "google",
+        "meta": "meta",
+        "facebook": "meta",
+        "instagram": "meta",
+    }
+
+    platform = platform_aliases.get(platform_input)
+    if platform is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported platform. Use Google Ads or Meta.",
+        )
+
+    # Never store credentials unless encryption succeeds.
+    try:
+        encrypted_access_token = encrypt_token(data.access_token)
+        encrypted_refresh_token = encrypt_token(data.refresh_token)
+    except RuntimeError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token encryption is not configured correctly.",
+        )
+
     connection = PlatformConnectionDB(
         user_id=current_user.id,
-        platform=data.platform,
+        platform=platform,
         account_id=data.account_id,
-        access_token=data.access_token,
-        refresh_token=data.refresh_token,
+        access_token=encrypted_access_token,
+        refresh_token=encrypted_refresh_token,
     )
 
     db.add(connection)
@@ -1207,11 +1283,17 @@ def get_subscription(
     if not subscription:
         subscription = SubscriptionDB(
             user_id=current_user.id,
-            plan="free",
-            status="active",
+            plan="none",
+            status="pending",
         )
-
         db.add(subscription)
+        db.commit()
+        db.refresh(subscription)
+
+    # Legacy free accounts do not receive paid access.
+    if subscription.plan and subscription.plan.strip().lower() == "free":
+        subscription.plan = "none"
+        subscription.status = "pending"
         db.commit()
         db.refresh(subscription)
 
@@ -1463,7 +1545,7 @@ def safe_spend(
         )
 
     try:
-        transaction = record_spend(
+        transaction = safety_record_spend(
             db=db,
             campaign=campaign,
             amount=amount,
@@ -1960,6 +2042,9 @@ def approve_ai_decision(
             detail="AI decision not found",
         )
 
+    if decision.status != "shadow":
+        raise HTTPException(status_code=409, detail=f"Cannot approve a decision with status {decision.status!r}.")
+
     decision.status = "approved"
 
     db.commit()
@@ -1996,6 +2081,9 @@ def reject_ai_decision(
             detail="AI decision not found",
         )
 
+    if decision.status != "shadow":
+        raise HTTPException(status_code=409, detail=f"Cannot reject a decision with status {decision.status!r}.")
+
     decision.status = "rejected"
 
     db.commit()
@@ -2004,4 +2092,925 @@ def reject_ai_decision(
         "message": "AI decision rejected",
         "decision_id": decision.id,
         "status": decision.status,
+    }
+
+# ============================================================
+# ADPILOT_GROWTH_API_V1
+# New AI planning endpoints. Recommendations only; no live ad spend.
+# ============================================================
+
+from typing import Any
+from market_discovery import discover_markets
+from regional_discovery import discover_regions
+from experiment_planner import create_experiment_plan
+from experiment_learning import learn_from_experiments
+from growth_planner import build_growth_plan
+
+
+class MarketDiscoveryRequest(BaseModel):
+    campaign: dict
+    markets: list[dict]
+    max_markets: int = Field(default=3, ge=1, le=25)
+
+
+class RegionalDiscoveryRequest(BaseModel):
+    country: str
+    regions: list[dict]
+    max_regions: int = Field(default=5, ge=1, le=50)
+
+
+class ExperimentPlanRequest(BaseModel):
+    discovery_budget: float = Field(ge=0)
+    round_budget: Optional[float] = Field(default=None, ge=0)
+    market_discovery: dict
+    max_experiments: int = Field(default=3, ge=1, le=25)
+
+
+class ExperimentLearningRequest(BaseModel):
+    experiments: list[dict]
+
+
+class GrowthPlanRequest(BaseModel):
+    campaign: dict
+    markets: list[dict]
+    discovery_budget: float = Field(ge=0)
+    round_budget: Optional[float] = Field(default=None, ge=0)
+    regions_by_country: dict[str, list[dict]] = Field(default_factory=dict)
+    experiment_results: list[dict] = Field(default_factory=list)
+    max_markets: int = Field(default=3, ge=1, le=25)
+    max_regions: int = Field(default=5, ge=1, le=50)
+
+
+@app.post("/ai/market-discovery")
+def api_market_discovery(
+    payload: MarketDiscoveryRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    try:
+        return discover_markets(
+            payload.campaign,
+            payload.markets,
+            max_markets=payload.max_markets,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/ai/regional-discovery")
+def api_regional_discovery(
+    payload: RegionalDiscoveryRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    try:
+        return discover_regions(
+            payload.country,
+            payload.regions,
+            max_regions=payload.max_regions,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/ai/experiment-plan")
+def api_experiment_plan(
+    payload: ExperimentPlanRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    try:
+        return create_experiment_plan(
+            discovery_budget=payload.discovery_budget,
+            round_budget=payload.round_budget,
+            market_discovery=payload.market_discovery,
+            max_experiments=payload.max_experiments,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/ai/learn")
+def api_experiment_learning(
+    payload: ExperimentLearningRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    try:
+        return learn_from_experiments(payload.experiments)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/ai/growth-plan")
+def api_growth_plan(
+    payload: GrowthPlanRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    try:
+        return build_growth_plan(
+            campaign=payload.campaign,
+            markets=payload.markets,
+            discovery_budget=payload.discovery_budget,
+            round_budget=payload.round_budget,
+            regions_by_country=payload.regions_by_country,
+            experiment_results=payload.experiment_results,
+            max_markets=payload.max_markets,
+            max_regions=payload.max_regions,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+# ============================================================
+# ADPILOT_SAVED_GROWTH_PLAN_V1
+# Uses saved campaign and experiment records.
+# Recommendations only: never launches ads or spends money.
+# ============================================================
+
+from datetime import date as _growth_date
+from database import CampaignDB as _GrowthCampaignDB
+from database import ExperimentDB as _GrowthExperimentDB
+
+
+class SavedGrowthPlanRequest(BaseModel):
+    # Supply market candidates and optional campaign context.
+    # Actual campaign budgets and country come from the database.
+    markets: list[dict] = Field(default_factory=list)
+    campaign_context: dict = Field(default_factory=dict)
+    regions_by_country: dict[str, list[dict]] = Field(default_factory=dict)
+    round_budget: Optional[float] = Field(default=None, ge=0)
+    max_markets: int = Field(default=3, ge=1, le=25)
+    max_regions: int = Field(default=5, ge=1, le=50)
+
+
+@app.post("/campaigns/{campaign_id}/growth-plan")
+def saved_campaign_growth_plan(
+    campaign_id: int,
+    payload: SavedGrowthPlanRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    # Only the owner of the campaign may use its records.
+    campaign = (
+        db.query(_GrowthCampaignDB)
+        .filter(
+            _GrowthCampaignDB.id == campaign_id,
+            _GrowthCampaignDB.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if campaign is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Campaign not found.",
+        )
+
+    # Calculate remaining discovery budget from saved spending.
+    total_discovery_budget = max(
+        0.0, float(campaign.discovery_budget or 0)
+    )
+    discovery_spent = max(
+        0.0, float(campaign.discovery_spent or 0)
+    )
+    remaining_discovery_budget = round(
+        max(0.0, total_discovery_budget - discovery_spent), 2
+    )
+
+    requested_round_budget = payload.round_budget
+    if requested_round_budget is None:
+        effective_round_budget = remaining_discovery_budget
+    else:
+        effective_round_budget = min(
+            float(requested_round_budget),
+            remaining_discovery_budget,
+        )
+
+    # Load this campaign's actual saved experiment records.
+    saved_experiments = (
+        db.query(_GrowthExperimentDB)
+        .filter(_GrowthExperimentDB.campaign_id == campaign.id)
+        .all()
+    )
+
+    # Learn from experiments that have recorded results.
+    experiment_results = []
+    for experiment in saved_experiments:
+        spend = float(experiment.spent or 0)
+        revenue = float(experiment.revenue or 0)
+
+        if (
+            str(experiment.status or "").lower() == "completed"
+            or spend > 0
+        ):
+            experiment_results.append({
+                "experiment_id": experiment.id,
+                "name": experiment.name,
+                "experiment_type": experiment.experiment_type,
+                "target": experiment.target,
+                "platform": experiment.platform,
+                "status": experiment.status,
+                "country": (
+                    experiment.target
+                    if experiment.experiment_type == "country"
+                    else campaign.country
+                ),
+                "spend": spend,
+                "revenue": revenue,
+                "clicks": int(experiment.clicks or 0),
+                "conversions": int(experiment.conversions or 0),
+            })
+
+    # Saved budget/country fields override caller-provided values.
+    campaign_data = dict(payload.campaign_context)
+    campaign_data.update({
+        "id": campaign.id,
+        "name": campaign.name,
+        "country": campaign.country,
+        "monthly_budget": float(campaign.monthly_budget or 0),
+        "discovery_budget": remaining_discovery_budget,
+        "month": _growth_date.today().month,
+    })
+
+    try:
+        report = build_growth_plan(
+            campaign=campaign_data,
+            markets=payload.markets,
+            discovery_budget=remaining_discovery_budget,
+            round_budget=effective_round_budget,
+            regions_by_country=payload.regions_by_country,
+            experiment_results=experiment_results,
+            max_markets=payload.max_markets,
+            max_regions=payload.max_regions,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    report["saved_campaign"] = {
+        "campaign_id": campaign.id,
+        "campaign_name": campaign.name,
+        "country": campaign.country,
+        "monthly_budget": float(campaign.monthly_budget or 0),
+        "discovery_budget_total": total_discovery_budget,
+        "discovery_spent_recorded": discovery_spent,
+        "discovery_budget_remaining": remaining_discovery_budget,
+    }
+    report["data_sources"] = {
+        "campaign_loaded_from_database": True,
+        "experiments_loaded_from_database": True,
+        "experiments_available": len(saved_experiments),
+        "experiments_with_results_analyzed": len(experiment_results),
+        "market_candidates_supplied": len(payload.markets),
+    }
+    report["spending_executed"] = False
+
+    return report
+
+
+# ============================================================
+# ADPILOT_RECOMMENDATION_LEDGER_V1
+# Persists review-only AI budget recommendations.
+# No platform execution or actual spending.
+# ============================================================
+
+from database import AIDecisionDB as _GrowthAIDecisionDB
+
+
+class BudgetRecommendationItem(BaseModel):
+    decision_type: str = Field(min_length=1, max_length=80)
+    platform: str = Field(default="unknown", max_length=80)
+    country: Optional[str] = None
+    region: Optional[str] = None
+    audience: Optional[str] = None
+    day_of_week: Optional[str] = None
+    hour: Optional[int] = Field(default=None, ge=0, le=23)
+    recommended_budget: float = Field(ge=0)
+    expected_roas: float = Field(default=0, ge=0)
+    confidence: float = Field(default=0, ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class SaveBudgetRecommendationsRequest(BaseModel):
+    recommendations: list[BudgetRecommendationItem] = Field(
+        min_length=1, max_length=100
+    )
+
+
+@app.post("/campaigns/{campaign_id}/ai-recommendations")
+def save_campaign_ai_recommendations(
+    campaign_id: int,
+    payload: SaveBudgetRecommendationsRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    campaign = (
+        db.query(_GrowthCampaignDB)
+        .filter(
+            _GrowthCampaignDB.id == campaign_id,
+            _GrowthCampaignDB.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    monthly_budget = max(0.0, float(campaign.monthly_budget or 0))
+    month_spend = max(0.0, float(campaign.spent_this_month or 0))
+    monthly_remaining = round(max(0.0, monthly_budget - month_spend), 2)
+
+    proposed_total = round(
+        sum(item.recommended_budget for item in payload.recommendations), 2
+    )
+
+    if proposed_total > monthly_remaining + 0.000001:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Recommendations exceed the campaign's remaining monthly budget.",
+                "monthly_budget": monthly_budget,
+                "spent_this_month": month_spend,
+                "monthly_remaining": monthly_remaining,
+                "proposed_total": proposed_total,
+            },
+        )
+
+    saved = []
+    try:
+        for item in payload.recommendations:
+            decision = _GrowthAIDecisionDB(
+                campaign_id=campaign.id,
+                decision_type=item.decision_type,
+                platform=item.platform,
+                country=item.country or campaign.country,
+                region=item.region,
+                audience=item.audience,
+                day_of_week=item.day_of_week,
+                hour=item.hour,
+                recommended_budget=item.recommended_budget,
+                expected_roas=item.expected_roas,
+                confidence=item.confidence,
+                reason=item.reason,
+                status="shadow",
+            )
+            db.add(decision)
+            saved.append(decision)
+
+        db.commit()
+
+        for decision in saved:
+            db.refresh(decision)
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save recommendations. No ads were launched.",
+        )
+
+    return {
+        "campaign_id": campaign.id,
+        "recommendations_saved": len(saved),
+        "proposed_total": proposed_total,
+        "monthly_remaining_at_save": monthly_remaining,
+        "status": "shadow",
+        "spending_executed": False,
+        "recommendations": [
+            {
+                "id": decision.id,
+                "decision_type": decision.decision_type,
+                "platform": decision.platform,
+                "country": decision.country,
+                "region": decision.region,
+                "audience": decision.audience,
+                "day_of_week": decision.day_of_week,
+                "hour": decision.hour,
+                "recommended_budget": decision.recommended_budget,
+                "expected_roas": decision.expected_roas,
+                "confidence": decision.confidence,
+                "reason": decision.reason,
+                "status": decision.status,
+            }
+            for decision in saved
+        ],
+    }
+
+
+# ============================================================
+# ADPILOT_RECOMMENDATION_LIST_V1
+# Lists saved AI recommendations for the campaign owner.
+# Review-only: this endpoint never launches ads.
+# ============================================================
+
+@app.get("/campaigns/{campaign_id}/ai-recommendations")
+def list_campaign_ai_recommendations(
+    campaign_id: int,
+    status: Optional[str] = None,
+    current_user: UserDB = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    campaign = (
+        db.query(_GrowthCampaignDB)
+        .filter(
+            _GrowthCampaignDB.id == campaign_id,
+            _GrowthCampaignDB.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    query = db.query(_GrowthAIDecisionDB).filter(
+        _GrowthAIDecisionDB.campaign_id == campaign.id
+    )
+
+    if status:
+        query = query.filter(_GrowthAIDecisionDB.status == status)
+
+    decisions = query.order_by(
+        _GrowthAIDecisionDB.id.desc()
+    ).all()
+
+    return {
+        "campaign_id": campaign.id,
+        "count": len(decisions),
+        "status_filter": status,
+        "spending_executed": False,
+        "recommendations": [
+            {
+                "id": item.id,
+                "decision_type": item.decision_type,
+                "platform": item.platform,
+                "country": item.country,
+                "region": item.region,
+                "audience": item.audience,
+                "day_of_week": item.day_of_week,
+                "hour": item.hour,
+                "recommended_budget": item.recommended_budget,
+                "expected_roas": item.expected_roas,
+                "confidence": item.confidence,
+                "reason": item.reason,
+                "status": item.status,
+                "created_at": (
+                    item.created_at.isoformat()
+                    if item.created_at
+                    else None
+                ),
+            }
+            for item in decisions
+        ],
+    }
+
+
+# ============================================================
+# ADPILOT_RECOMMENDATION_REVIEW_V1
+# Owner-controlled approval/rejection; no live ad execution.
+# ============================================================
+
+class ReviewAIRecommendationRequest(BaseModel):
+    action: str = Field(min_length=1, max_length=20)
+    review_note: Optional[str] = Field(default=None, max_length=2000)
+
+
+@app.post(
+    "/campaigns/{campaign_id}/ai-recommendations/{decision_id}/review"
+)
+def review_campaign_ai_recommendation(
+    campaign_id: int,
+    decision_id: int,
+    payload: ReviewAIRecommendationRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    action = payload.action.strip().lower()
+
+    if action not in {"approve", "reject"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Action must be 'approve' or 'reject'.",
+        )
+
+    campaign = (
+        db.query(_GrowthCampaignDB)
+        .filter(
+            _GrowthCampaignDB.id == campaign_id,
+            _GrowthCampaignDB.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    decision = (
+        db.query(_GrowthAIDecisionDB)
+        .filter(
+            _GrowthAIDecisionDB.id == decision_id,
+            _GrowthAIDecisionDB.campaign_id == campaign.id,
+        )
+        .first()
+    )
+
+    if decision is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Recommendation not found for this campaign.",
+        )
+
+    if decision.status not in {"shadow", "pending", "approved", "rejected"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot review a recommendation with status '{decision.status}'.",
+        )
+
+    decision.status = "approved" if action == "approve" else "rejected"
+
+    if payload.review_note:
+        existing_reason = decision.reason or ""
+        decision.reason = (
+            existing_reason
+            + "\nReview note: "
+            + payload.review_note.strip()
+        )[:2000]
+
+    try:
+        db.commit()
+        db.refresh(decision)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the recommendation review.",
+        )
+
+    return {
+        "campaign_id": campaign.id,
+        "recommendation_id": decision.id,
+        "status": decision.status,
+        "review_action": action,
+        "spending_executed": False,
+        "message": (
+            "Recommendation approved for review; no ads were launched."
+            if action == "approve"
+            else "Recommendation rejected; no ads were launched."
+        ),
+    }
+
+
+# ============================================================
+# ADPILOT_BACKEND_COMPLETION_PACK_V1
+# Dashboard, analytics, budget visibility and saved growth plans.
+# Review-only: this pack never launches ads or spends money.
+# ============================================================
+
+import json as _adpilot_completion_json
+import inspect as _adpilot_completion_inspect
+from database import SpendingTransactionDB as _AdpilotTransactionDB
+
+
+def _adpilot_completion_iso(value):
+    return value.isoformat() if value is not None else None
+
+
+def _adpilot_owned_campaign(campaign_id, current_user, db):
+    campaign = (
+        db.query(_GrowthCampaignDB)
+        .filter(
+            _GrowthCampaignDB.id == campaign_id,
+            _GrowthCampaignDB.user_id == current_user.id,
+        )
+        .first()
+    )
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+    return campaign
+
+
+def _adpilot_campaign_experiments(campaign_id, db):
+    return (
+        db.query(_GrowthExperimentDB)
+        .filter(_GrowthExperimentDB.campaign_id == campaign_id)
+        .order_by(_GrowthExperimentDB.id.desc())
+        .all()
+    )
+
+
+def _adpilot_campaign_decisions(campaign_id, db):
+    return (
+        db.query(_GrowthAIDecisionDB)
+        .filter(_GrowthAIDecisionDB.campaign_id == campaign_id)
+        .order_by(_GrowthAIDecisionDB.id.desc())
+        .all()
+    )
+
+
+@app.post("/campaigns/{campaign_id}/generate-and-save-growth-plan")
+async def adpilot_generate_and_save_growth_plan(
+    campaign_id: int,
+       payload: SavedGrowthPlanRequest,
+    current_user: UserDB = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    campaign = _adpilot_owned_campaign(campaign_id, current_user, db)
+
+    growth_route = next(
+        (
+            route for route in app.routes
+            if getattr(route, "path", None)
+            == "/campaigns/{campaign_id}/growth-plan"
+            and "POST" in (getattr(route, "methods", None) or set())
+        ),
+        None,
+    )
+
+    if growth_route is None:
+        raise HTTPException(
+            status_code=500,
+            detail="The existing growth-plan endpoint is unavailable.",
+        )
+
+    try:
+        plan = growth_route.endpoint(
+            payload=payload,
+            campaign_id=campaign_id,
+            current_user=current_user,
+            db=db,
+        )
+        if _adpilot_completion_inspect.isawaitable(plan):
+            plan = await plan
+
+        if not isinstance(plan, dict):
+            raise ValueError("Growth plan was not returned as an object.")
+
+        # Preserve the complete generated plan in the saved snapshot.
+        snapshot = _adpilot_completion_json.dumps(
+            plan, default=str, separators=(",", ":")
+        )
+
+        decision = _GrowthAIDecisionDB(
+            campaign_id=campaign.id,
+            decision_type="growth_plan_snapshot",
+            platform="unknown",
+            country=campaign.country,
+            recommended_budget=0,
+            expected_roas=0,
+            confidence=0,
+            reason="Generated growth-plan snapshot for review: " + snapshot,
+            status="shadow",
+        )
+        db.add(decision)
+        db.commit()
+        db.refresh(decision)
+
+        return {
+            "campaign_id": campaign.id,
+            "snapshot_id": decision.id,
+            "status": "shadow",
+            "growth_plan": plan,
+            "snapshot_saved": True,
+            "spending_executed": False,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not generate and save the plan. No ads were launched.",
+        )
+
+
+@app.get("/campaigns/{campaign_id}/dashboard")
+def adpilot_campaign_dashboard(
+    campaign_id: int,
+    current_user: UserDB = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    campaign = _adpilot_owned_campaign(campaign_id, current_user, db)
+    experiments = _adpilot_campaign_experiments(campaign.id, db)
+    decisions = _adpilot_campaign_decisions(campaign.id, db)
+
+    transactions = (
+        db.query(_AdpilotTransactionDB)
+        .filter(_AdpilotTransactionDB.campaign_id == campaign.id)
+        .order_by(_AdpilotTransactionDB.id.desc())
+        .limit(20)
+        .all()
+    )
+
+    monthly_budget = max(0.0, float(campaign.monthly_budget or 0))
+    month_spend = max(0.0, float(campaign.spent_this_month or 0))
+    discovery_budget = max(0.0, float(campaign.discovery_budget or 0))
+    discovery_spend = max(0.0, float(campaign.discovery_spent or 0))
+
+    status_counts = {}
+    for decision in decisions:
+        status = decision.status or "unknown"
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    return {
+        "campaign": {
+            "id": campaign.id,
+            "name": campaign.name,
+            "status": campaign.status,
+            "country": campaign.country,
+            "monthly_budget": monthly_budget,
+            "spent_this_month": month_spend,
+            "monthly_remaining": round(max(0, monthly_budget - month_spend), 2),
+            "discovery_budget": discovery_budget,
+            "discovery_spent": discovery_spend,
+            "discovery_remaining": round(
+                max(0, discovery_budget - discovery_spend), 2
+            ),
+            "spent_today": float(campaign.spent_today or 0),
+            "spending_date": _adpilot_completion_iso(campaign.spending_date),
+        },
+        "experiment_count": len(experiments),
+        "recent_experiments": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "type": item.experiment_type,
+                "target": item.target,
+                "platform": item.platform,
+                "budget": float(item.budget or 0),
+                "spent": float(item.spent or 0),
+                "clicks": int(item.clicks or 0),
+                "conversions": int(item.conversions or 0),
+                "revenue": float(item.revenue or 0),
+                "status": item.status,
+            }
+            for item in experiments[:10]
+        ],
+        "recommendation_count": len(decisions),
+        "recommendation_status_counts": status_counts,
+        "recent_recommendations": [
+            {
+                "id": item.id,
+                "decision_type": item.decision_type,
+                "platform": item.platform,
+                "country": item.country,
+                "region": item.region,
+                "recommended_budget": float(item.recommended_budget or 0),
+                "expected_roas": float(item.expected_roas or 0),
+                "confidence": float(item.confidence or 0),
+                "reason": item.reason,
+                "status": item.status,
+                "created_at": _adpilot_completion_iso(item.created_at),
+            }
+            for item in decisions[:20]
+        ],
+        "recent_transactions": [
+            {
+                "id": item.id,
+                "amount": float(item.amount or 0),
+                "platform": item.platform,
+                "country": item.country,
+                "spending_type": item.spending_type,
+                "created_at": _adpilot_completion_iso(item.created_at),
+            }
+            for item in transactions
+        ],
+        "spending_executed_by_this_endpoint": False,
+    }
+
+
+@app.get("/campaigns/{campaign_id}/analytics")
+def adpilot_campaign_analytics(
+    campaign_id: int,
+    current_user: UserDB = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    campaign = _adpilot_owned_campaign(campaign_id, current_user, db)
+    experiments = _adpilot_campaign_experiments(campaign.id, db)
+
+    total_spend = sum(float(item.spent or 0) for item in experiments)
+    total_revenue = sum(float(item.revenue or 0) for item in experiments)
+    total_clicks = sum(int(item.clicks or 0) for item in experiments)
+    total_conversions = sum(int(item.conversions or 0) for item in experiments)
+
+    return {
+        "campaign_id": campaign.id,
+        "experiment_count": len(experiments),
+        "experiment_spend": round(total_spend, 2),
+        "experiment_revenue": round(total_revenue, 2),
+        "experiment_roas": (
+            round(total_revenue / total_spend, 4)
+            if total_spend > 0 else None
+        ),
+        "clicks": total_clicks,
+        "conversions": total_conversions,
+        "conversion_rate": (
+            round(total_conversions / total_clicks, 4)
+            if total_clicks > 0 else None
+        ),
+        "data_note": (
+            "Metrics are calculated from saved experiment records. "
+            "They are not independently verified platform-wide totals."
+        ),
+    }
+
+
+@app.get("/campaigns/{campaign_id}/budget-status")
+def adpilot_campaign_budget_status(
+    campaign_id: int,
+    current_user: UserDB = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    campaign = _adpilot_owned_campaign(campaign_id, current_user, db)
+
+    monthly_budget = max(0.0, float(campaign.monthly_budget or 0))
+    month_spend = max(0.0, float(campaign.spent_this_month or 0))
+    daily_spend = max(0.0, float(campaign.spent_today or 0))
+    discovery_budget = max(0.0, float(campaign.discovery_budget or 0))
+    discovery_spend = max(0.0, float(campaign.discovery_spent or 0))
+
+    configured_daily_limit = getattr(campaign, "daily_target", None)
+    if configured_daily_limit is None and monthly_budget > 0:
+        configured_daily_limit = round(monthly_budget / 30.4375, 2)
+
+    daily_limit = (
+        max(0.0, float(configured_daily_limit))
+        if configured_daily_limit is not None else None
+    )
+    monthly_remaining = round(max(0.0, monthly_budget - month_spend), 2)
+    discovery_remaining = round(
+        max(0.0, discovery_budget - discovery_spend), 2
+    )
+    daily_remaining = (
+        round(max(0.0, daily_limit - daily_spend), 2)
+        if daily_limit is not None else None
+    )
+
+    return {
+        "campaign_id": campaign.id,
+        "campaign_status": campaign.status,
+        "monthly_budget": monthly_budget,
+        "spent_this_month": month_spend,
+        "monthly_remaining": monthly_remaining,
+        "daily_limit": daily_limit,
+        "spent_today": daily_spend,
+        "daily_remaining": daily_remaining,
+        "discovery_budget": discovery_budget,
+        "discovery_spent": discovery_spend,
+        "discovery_remaining": discovery_remaining,
+        "appears_within_recorded_limits": (
+            monthly_remaining > 0
+            and (daily_remaining is None or daily_remaining > 0)
+        ),
+        "this_is_a_status_check_not_a_spending_lock": True,
+        "spending_executed": False,
+    }
+
+
+@app.get("/system/backend-capabilities")
+def adpilot_backend_capabilities():
+    registered = {
+        (route.path, method)
+        for route in app.routes
+        if hasattr(route, "path")
+        for method in (getattr(route, "methods", None) or set())
+    }
+
+    expected = {
+        "growth_plan": (
+            "/campaigns/{campaign_id}/growth-plan", "POST"
+        ),
+        "generate_and_save_growth_plan": (
+            "/campaigns/{campaign_id}/generate-and-save-growth-plan", "POST"
+        ),
+        "recommendation_list": (
+            "/campaigns/{campaign_id}/ai-recommendations", "GET"
+        ),
+        "recommendation_save": (
+            "/campaigns/{campaign_id}/ai-recommendations", "POST"
+        ),
+        "recommendation_review": (
+            "/campaigns/{campaign_id}/ai-recommendations/{decision_id}/review",
+            "POST",
+        ),
+        "campaign_dashboard": (
+            "/campaigns/{campaign_id}/dashboard", "GET"
+        ),
+        "campaign_analytics": (
+            "/campaigns/{campaign_id}/analytics", "GET"
+        ),
+        "budget_status": (
+            "/campaigns/{campaign_id}/budget-status", "GET"
+        ),
+    }
+
+    return {
+        "capabilities": {
+            name: {
+                "method": method,
+                "path": path,
+                "registered": (path, method) in registered,
+            }
+            for name, (path, method) in expected.items()
+        },
+        "all_expected_routes_registered": all(
+            (path, method) in registered
+            for path, method in expected.values()
+        ),
+        "live_ad_execution_enabled_by_this_pack": False,
     }

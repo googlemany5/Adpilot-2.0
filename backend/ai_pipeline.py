@@ -11,6 +11,22 @@ from budget_controller import validate_allocation_batch
 # AI DECISION PIPELINE
 # ============================================================
 
+def prepare_decision_fields(allocation: dict, safety: dict) -> dict:
+    import math
+    def amount(value):
+        try:
+            n = float(value)
+            return round(n, 2) if math.isfinite(n) and n >= 0 else 0.0
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+    requested = amount(safety.get("requested_budget", allocation.get("budget", allocation.get("recommended_budget", 0))))
+    approved = amount(safety.get("approved_budget", 0))
+    can_review = bool(safety.get("approved")) and approved > 0
+    budget = approved if can_review else 0.0
+    reason = (str(allocation.get("reason", "Optimizer recommendation")) + " Requested budget: $" + format(requested, ".2f") + "; safety-approved budget: $" + format(budget, ".2f") + ". Safety result: " + str(safety.get("reason", "No reason provided.")))
+    return {"status": "shadow" if can_review else "blocked", "recommended_budget": budget, "reason": reason}
+
+
 def run_ai_pipeline(
     db: Session,
     campaign: CampaignDB,
@@ -64,56 +80,31 @@ def run_ai_pipeline(
     )
 
     logged_decisions = []
+    safety_allocations = safety_result.get("allocations", [])
 
-    for allocation in allocations:
+    for index, allocation in enumerate(allocations):
+        safety = (
+            safety_allocations[index]
+            if index < len(safety_allocations)
+            else {}
+        )
+        fields = prepare_decision_fields(allocation, safety)
 
         decision = AIDecisionDB(
             campaign_id=campaign.id,
             decision_type="allocation",
-            platform=allocation.get(
-                "platform",
-                "unknown",
-            ),
-            country=allocation.get(
-                "country",
-            ),
-            region=allocation.get(
-                "region",
-            ),
-            audience=allocation.get(
-                "audience",
-            ),
-            day_of_week=allocation.get(
-                "day_of_week",
-            ),
-            hour=allocation.get(
-                "hour",
-            ),
-            recommended_budget=float(
-                allocation.get(
-                    "budget",
-                    0,
-                )
-            ),
-            expected_roas=float(
-                allocation.get(
-                    "expected_roas",
-                    0,
-                )
-            ),
-            confidence=float(
-                allocation.get(
-                    "confidence",
-                    0,
-                )
-            ),
-            reason=allocation.get(
-                "reason",
-                "Optimizer recommendation",
-            ),
-            status="shadow",
+            platform=allocation.get("platform", "unknown"),
+            country=allocation.get("country"),
+            region=allocation.get("region"),
+            audience=allocation.get("audience"),
+            day_of_week=allocation.get("day_of_week"),
+            hour=allocation.get("hour"),
+            recommended_budget=fields["recommended_budget"],
+            expected_roas=float(allocation.get("expected_roas", 0)),
+            confidence=float(allocation.get("confidence", 0)),
+            reason=fields["reason"],
+            status=fields["status"],
         )
-
         db.add(decision)
         logged_decisions.append(decision)
 
