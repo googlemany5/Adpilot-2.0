@@ -52,6 +52,22 @@ def billing_setup(monkeypatch):
 
     app.dependency_overrides[get_db] = override_get_db
     monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_fake")
+
+    # Checkout reconciliation uses a deterministic fake Stripe response.
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        lambda id, **kwargs: {
+            "id": id,
+            "customer": "cus_test_123",
+            "status": "incomplete",
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+    )
 
     client = TestClient(app, raise_server_exceptions=True)
 
@@ -587,3 +603,225 @@ def test_failed_webhook_event_can_be_retried(billing_setup, monkeypatch):
         .count()
         == 1
     )
+
+
+def test_out_of_order_subscription_event_reconciles_current_stripe_status(
+    billing_setup, monkeypatch
+):
+    client, db, user, subscription = billing_setup
+
+    # This earlier event has an unknown ID and cannot claim the account.
+    first = send_event(
+        monkeypatch,
+        client,
+        "customer.subscription.updated",
+        {
+            "id": "sub_new_checkout_123",
+            "customer": "cus_test_123",
+            "status": "active",
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+        created=1800000100,
+        event_id="evt_subscription_arrives_first",
+    )
+    assert first.status_code == 200
+
+    db.refresh(subscription)
+    assert subscription.stripe_subscription_id == "sub_test_123"
+    assert subscription.status == "pending"
+
+    # Checkout reconciliation sees Stripe's current active state.
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        lambda id, **kwargs: {
+            "id": id,
+            "customer": "cus_test_123",
+            "status": "active",
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+    )
+
+    second = send_event(
+        monkeypatch,
+        client,
+        "checkout.session.completed",
+        {
+            "id": "cs_new_checkout_123",
+            "customer": "cus_test_123",
+            "subscription": "sub_new_checkout_123",
+            "client_reference_id": str(user.id),
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+        created=1800000200,
+        event_id="evt_checkout_arrives_second",
+    )
+
+    assert second.status_code == 200
+    db.refresh(subscription)
+    assert subscription.stripe_subscription_id == "sub_new_checkout_123"
+    assert subscription.status == "active"
+
+
+
+
+def test_checkout_stripe_api_failure_is_retryable(
+    billing_setup, monkeypatch
+):
+    client, db, user, subscription = billing_setup
+
+    def fail_retrieval(id, **kwargs):
+        raise stripe.APIConnectionError("temporary Stripe connection failure")
+
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        fail_retrieval,
+    )
+
+    event_id = "evt_checkout_stripe_temporary_failure"
+    response = send_event(
+        monkeypatch,
+        client,
+        "checkout.session.completed",
+        {
+            "id": "cs_retry_test",
+            "customer": "cus_test_123",
+            "subscription": "sub_retry_test",
+            "client_reference_id": str(user.id),
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+        created=1800000300,
+        event_id=event_id,
+    )
+
+    assert response.status_code == 502
+    db.refresh(subscription)
+    assert subscription.status == "pending"
+    assert subscription.stripe_subscription_id == "sub_test_123"
+    assert (
+        db.query(billing.ProcessedStripeEventDB)
+        .filter_by(event_id=event_id)
+        .count()
+        == 0
+    )
+
+
+def test_checkout_rejects_subscription_with_mismatched_user_metadata(
+    billing_setup, monkeypatch
+):
+    client, db, user, subscription = billing_setup
+
+    other_user = UserDB(
+        email="stripe-metadata-other-user@example.com",
+        password_hash="not-used-in-this-test",
+        is_active=True,
+    )
+    db.add(other_user)
+    db.commit()
+    db.refresh(other_user)
+
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        lambda id, **kwargs: {
+            "id": id,
+            "customer": "cus_test_123",
+            "status": "active",
+            "metadata": {
+                "user_id": str(other_user.id),
+                "plan": "starter",
+            },
+        },
+    )
+
+    response = send_event(
+        monkeypatch,
+        client,
+        "checkout.session.completed",
+        {
+            "id": "cs_wrong_user_test",
+            "customer": "cus_test_123",
+            "subscription": "sub_wrong_user_test",
+            "client_reference_id": str(user.id),
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+        created=1800000400,
+        event_id="evt_checkout_wrong_user_metadata",
+    )
+
+    assert response.status_code == 200
+    db.refresh(subscription)
+    assert subscription.status == "pending"
+    assert subscription.stripe_subscription_id == "sub_test_123"
+    assert subscription.stripe_customer_id == "cus_test_123"
+
+def test_checkout_creation_sets_owner_and_plan_metadata(
+    billing_setup, monkeypatch
+):
+    from types import SimpleNamespace
+
+    client, db, user, subscription = billing_setup
+    captured = {}
+
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_fake")
+    monkeypatch.setenv(
+        "ADPILOT_FRONTEND_URL", "http://localhost:3000"
+    )
+    monkeypatch.setenv(
+        "STRIPE_STARTER_PRICE_ID", "price_starter_test"
+    )
+
+    app.dependency_overrides[billing.get_current_user] = lambda: user
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            url="https://checkout.stripe.com/test-session"
+        )
+
+    monkeypatch.setattr(
+        billing.stripe.checkout.Session,
+        "create",
+        fake_create,
+    )
+
+    try:
+        response = client.post(
+            "/billing/checkout",
+            json={"plan": "starter"},
+        )
+    finally:
+        app.dependency_overrides.pop(
+            billing.get_current_user, None
+        )
+
+    assert response.status_code == 200
+    assert response.json()["checkout_url"] == (
+        "https://checkout.stripe.com/test-session"
+    )
+
+    # The Checkout Session must identify the intended AdPilot account.
+    assert captured["client_reference_id"] == str(user.id)
+    assert captured["metadata"]["user_id"] == str(user.id)
+    assert captured["metadata"]["plan"] == "starter"
+
+    # The resulting Stripe subscription must carry the same identity.
+    subscription_metadata = captured["subscription_data"]["metadata"]
+    assert subscription_metadata["user_id"] == str(user.id)
+    assert subscription_metadata["plan"] == "starter"

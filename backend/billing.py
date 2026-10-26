@@ -265,8 +265,8 @@ async def stripe_webhook(
             if isinstance(customer_id, dict):
                 customer_id = customer_id.get("id")
 
-            # Do not let checkout attach identifiers already owned by
-            # another AdPilot account.
+            # Never let checkout claim Stripe identifiers owned by another
+            # AdPilot account.
             if _stripe_identifiers_conflict(
                 db,
                 subscription,
@@ -276,10 +276,57 @@ async def stripe_webhook(
                 db.commit()
                 return {"received": True}
 
-            same_subscription = (
-                bool(new_subscription_id)
-                and subscription.stripe_subscription_id == str(new_subscription_id)
-            )
+            # Reconcile checkout against Stripe's current subscription state.
+            # This handles subscription.updated arriving before checkout.
+            verified_status = None
+            if new_subscription_id:
+                stripe_secret = os.getenv("STRIPE_SECRET_KEY")
+                if not stripe_secret:
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Stripe subscription verification is unavailable.",
+                    )
+
+                try:
+                    provider_subscription = stripe.Subscription.retrieve(
+                        str(new_subscription_id),
+                        api_key=stripe_secret,
+                    )
+                except stripe.StripeError:
+                    # Roll back the event record too, so Stripe can retry.
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Stripe subscription verification failed. Please retry.",
+                    )
+
+                provider_id = provider_subscription.get("id")
+                provider_customer = provider_subscription.get("customer")
+                if isinstance(provider_customer, dict):
+                    provider_customer = provider_customer.get("id")
+
+                provider_metadata = provider_subscription.get("metadata") or {}
+                provider_user_id = provider_metadata.get("user_id")
+                provider_plan = (
+                    provider_metadata.get("plan") or ""
+                ).strip().lower()
+
+                # Do not attach or activate a subscription unless its identity,
+                # customer, user, and plan match this checkout.
+                if (
+                    str(provider_id or "") != str(new_subscription_id)
+                    or (
+                        customer_id
+                        and str(provider_customer or "") != str(customer_id)
+                    )
+                    or str(provider_user_id or "") != str(user_id)
+                    or provider_plan != plan
+                ):
+                    db.commit()
+                    return {"received": True}
+
+                verified_status = provider_subscription.get("status", "")
 
             subscription.plan = plan
             if customer_id:
@@ -287,8 +334,11 @@ async def stripe_webhook(
             if new_subscription_id:
                 subscription.stripe_subscription_id = str(new_subscription_id)
 
-            # Checkout completion alone never grants paid access.
-            if not same_subscription:
+            # Checkout completion is not itself proof of paid access.
+            # Only the verified current Stripe subscription status can activate.
+            if verified_status in {"active", "trialing"}:
+                subscription.status = "active"
+            else:
                 subscription.status = "pending"
 
             _record_stripe_event(subscription, event_created)
