@@ -142,3 +142,32 @@ def test_pending_subscription_cannot_create_campaign(
 
     assert response.status_code == 402
     assert db.query(CampaignDB).filter_by(user_id=user.id).count() == 0
+
+
+def test_database_rejects_duplicate_subscription_for_same_user(
+    subscription_test_setup,
+):
+    from sqlalchemy.exc import IntegrityError
+
+    _, db, user = subscription_test_setup
+
+    add_subscription(db, user, plan="starter", status="active")
+
+    duplicate = SubscriptionDB(
+        user_id=user.id,
+        plan="pro",
+        status="active",
+    )
+    db.add(duplicate)
+
+    with pytest.raises(IntegrityError):
+        db.flush()
+
+    db.rollback()
+
+    assert (
+        db.query(SubscriptionDB)
+        .filter_by(user_id=user.id)
+        .count()
+        == 1
+    )

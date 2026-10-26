@@ -359,6 +359,7 @@ class SubscriptionDB(Base):
         Integer,
         ForeignKey("users.id"),
         nullable=False,
+        unique=True,
         index=True,
     )
 
@@ -538,6 +539,30 @@ class AdvertisementDB(Base):
 # ============================================================
 
 Base.metadata.create_all(bind=engine)
+
+# Enforce one subscription record per user on SQLite databases.
+# Refuse to proceed if existing data violates this invariant.
+if engine.dialect.name == "sqlite":
+    with engine.begin() as connection:
+        duplicate_users = connection.exec_driver_sql(
+            "SELECT user_id, COUNT(*) FROM subscriptions "
+            "GROUP BY user_id HAVING COUNT(*) > 1 LIMIT 10"
+        ).fetchall()
+
+        if duplicate_users:
+            details = ", ".join(
+                f"user_id={row[0]} (records={row[1]})"
+                for row in duplicate_users
+            )
+            raise RuntimeError(
+                "Cannot enforce unique subscriptions: duplicate records exist: "
+                + details
+            )
+
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_subscriptions_user_id "
+            "ON subscriptions (user_id)"
+        )
 
 # Safely add the timestamp column to existing SQLite databases.
 if engine.dialect.name == "sqlite":
