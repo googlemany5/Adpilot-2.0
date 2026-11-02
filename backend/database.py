@@ -1,6 +1,7 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from sqlalchemy import (
+    Index,
     create_engine,
     Column,
     Integer,
@@ -21,11 +22,32 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # DATABASE CONNECTION
 # ============================================================
 
-DATABASE_URL = "sqlite:///./adpilot.db"
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./adpilot.db").strip()
+
+# Explicitly use Psycopg 3 for PostgreSQL connections.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://", "postgresql+psycopg://", 1
+    )
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgresql://", "postgresql+psycopg://", 1
+    )
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL must not be empty.")
+
+_connect_args = (
+    {"check_same_thread": False, "timeout": 30}
+    if DATABASE_URL.startswith("sqlite:")
+    else {}
+)
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args=_connect_args,
 )
 
 SessionLocal = sessionmaker(
@@ -73,8 +95,20 @@ class UserDB(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
+
+
+# ============================================================
+# AUTHENTICATION RATE LIMITS
+# ============================================================
+
+class RateLimitBucketDB(Base):
+    __tablename__ = "rate_limit_buckets"
+
+    bucket_key = Column(String(64), primary_key=True)
+    request_count = Column(Integer, nullable=False, default=0)
+    window_start = Column(Integer, nullable=False, index=True)
 
 
 # ============================================================
@@ -135,6 +169,12 @@ class CampaignDB(Base):
         default=date.today().month,
     )
 
+    spending_year = Column(
+        Integer,
+        default=lambda: date.today().year,
+        nullable=False,
+    )
+
     discovery_spent = Column(
         Float,
         default=0,
@@ -142,7 +182,7 @@ class CampaignDB(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
 
@@ -181,7 +221,7 @@ class SpendingTransactionDB(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
 
@@ -241,7 +281,7 @@ class ExperimentDB(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
     completed_at = Column(
@@ -299,7 +339,7 @@ class DiscountCodeDB(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
 
@@ -331,7 +371,7 @@ class DiscountRedemptionDB(Base):
 
     redeemed_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
 
@@ -347,11 +387,15 @@ class ProcessedStripeEventDB(Base):
     event_id = Column(String, primary_key=True)
     event_type = Column(String, nullable=False)
     event_created = Column(Integer, nullable=False)
-    processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    processed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), nullable=False)
 
 
 class SubscriptionDB(Base):
     __tablename__ = "subscriptions"
+
+    __table_args__ = (
+        Index("uq_subscriptions_user_id", "user_id", unique=True),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 
@@ -359,7 +403,6 @@ class SubscriptionDB(Base):
         Integer,
         ForeignKey("users.id"),
         nullable=False,
-        unique=True,
         index=True,
     )
 
@@ -397,7 +440,7 @@ class SubscriptionDB(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
 
@@ -446,7 +489,7 @@ class AIDecisionDB(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
 
@@ -484,7 +527,7 @@ class PlatformConnectionDB(Base):
 
     connected_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
 
@@ -530,49 +573,63 @@ class AdvertisementDB(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
     )
 
 
-# ============================================================
-# CREATE DATABASE TABLES
-# ============================================================
+# Production must use Alembic migrations instead of automatic schema creation.
+if (
+    os.getenv("ADPILOT_ENVIRONMENT", "development").strip().lower()
+    == "production"
+    and os.getenv("ADPILOT_SKIP_DB_INIT") != "1"
+):
+    raise RuntimeError(
+        "Production database initialization is disabled. "
+        "Run 'alembic upgrade head' before starting the API, "
+        "and set ADPILOT_SKIP_DB_INIT=1."
+    )
 
-Base.metadata.create_all(bind=engine)
 
-# Enforce one subscription record per user on SQLite databases.
-# Refuse to proceed if existing data violates this invariant.
-if engine.dialect.name == "sqlite":
-    with engine.begin() as connection:
-        duplicate_users = connection.exec_driver_sql(
-            "SELECT user_id, COUNT(*) FROM subscriptions "
-            "GROUP BY user_id HAVING COUNT(*) > 1 LIMIT 10"
-        ).fetchall()
+if os.getenv("ADPILOT_SKIP_DB_INIT") != "1":
+    # ============================================================
+    # CREATE DATABASE TABLES
+    # ============================================================
 
-        if duplicate_users:
-            details = ", ".join(
-                f"user_id={row[0]} (records={row[1]})"
-                for row in duplicate_users
-            )
-            raise RuntimeError(
-                "Cannot enforce unique subscriptions: duplicate records exist: "
-                + details
-            )
+    Base.metadata.create_all(bind=engine)
 
-        connection.exec_driver_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_subscriptions_user_id "
-            "ON subscriptions (user_id)"
-        )
-
-# Safely add the timestamp column to existing SQLite databases.
-if engine.dialect.name == "sqlite":
-    columns = {
-        column["name"]
-        for column in inspect(engine).get_columns("subscriptions")
-    }
-    if "last_stripe_event_created" not in columns:
+    # Enforce one subscription record per user on SQLite databases.
+    # Refuse to proceed if existing data violates this invariant.
+    if engine.dialect.name == "sqlite":
         with engine.begin() as connection:
+            duplicate_users = connection.exec_driver_sql(
+                "SELECT user_id, COUNT(*) FROM subscriptions "
+                "GROUP BY user_id HAVING COUNT(*) > 1 LIMIT 10"
+            ).fetchall()
+
+            if duplicate_users:
+                details = ", ".join(
+                    f"user_id={row[0]} (records={row[1]})"
+                    for row in duplicate_users
+                )
+                raise RuntimeError(
+                    "Cannot enforce unique subscriptions: duplicate records exist: "
+                    + details
+                )
+
             connection.exec_driver_sql(
-                "ALTER TABLE subscriptions "
-                "ADD COLUMN last_stripe_event_created INTEGER"
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_subscriptions_user_id "
+                "ON subscriptions (user_id)"
             )
+
+    # Safely add the timestamp column to existing SQLite databases.
+    if engine.dialect.name == "sqlite":
+        columns = {
+            column["name"]
+            for column in inspect(engine).get_columns("subscriptions")
+        }
+        if "last_stripe_event_created" not in columns:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "ALTER TABLE subscriptions "
+                    "ADD COLUMN last_stripe_event_created INTEGER"
+                )

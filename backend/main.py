@@ -3,9 +3,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / '.env', override=False)
 
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Optional
 
+from fastapi import Request
 from fastapi import (
     FastAPI,
     Depends,
@@ -13,12 +14,12 @@ from fastapi import (
     status,
 )
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
 from sqlalchemy.orm import Session
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 
 from database import (
-    Base,
-    engine,
     SessionLocal,
     UserDB,
     CampaignDB,
@@ -31,6 +32,8 @@ from database import (
     PlatformConnectionDB,
     AdvertisementDB,
 )
+
+from rate_limiter import enforce_rate_limit
 
 from auth import (
     get_db,
@@ -46,13 +49,6 @@ from billing import router as billing_router
 from plan_config import get_campaign_limit
 from platform_oauth import router as platform_oauth_router
 from account_discovery import router as account_discovery_router
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-Base.metadata.create_all(bind=engine)
 
 
 # ============================================================
@@ -81,6 +77,8 @@ from safety import (
     resume_campaign,
     emergency_pause_campaign,
     record_spend as safety_record_spend,
+    reset_daily_if_needed,
+    reset_monthly_if_needed,
 )
 
 from budget_controller import (
@@ -125,7 +123,7 @@ def home():
 def health():
     return {
         "status": "healthy",
-        "timestamp": datetime.utcnow(),
+        "timestamp": datetime.now(timezone.utc).replace(tzinfo=None),
     }
 
 
@@ -148,8 +146,7 @@ class UserResponse(BaseModel):
     is_active: bool
     is_admin: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ============================================================
@@ -159,9 +156,16 @@ class UserResponse(BaseModel):
 @app.post("/auth/register")
 def register(
     user_data: UserCreate,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     email = user_data.email.lower()
+
+    enforce_rate_limit(
+        db, request, "register",
+        ip_limit=5,
+        window_seconds=3600,
+    )
 
     existing = (
         db.query(UserDB)
@@ -182,18 +186,45 @@ def register(
         last_name=user_data.last_name,
     )
 
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    try:
+        # Save the user and subscription in the same transaction.
+        db.add(user)
+        db.flush()  # Assigns user.id without committing.
 
-    subscription = SubscriptionDB(
-        user_id=user.id,
-        plan="none",
-        status="pending",
-    )
+        subscription = SubscriptionDB(
+            user_id=user.id,
+            plan="none",
+            status="pending",
+        )
 
-    db.add(subscription)
-    db.commit()
+        db.add(subscription)
+        db.commit()
+        db.refresh(user)
+
+    except IntegrityError:
+        db.rollback()
+
+        # Handle a possible duplicate-email registration race.
+        existing = (
+            db.query(UserDB)
+            .filter(UserDB.email == email)
+            .first()
+        )
+
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="An account with that email already exists",
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Account registration could not be completed",
+        )
+
+    except Exception:
+        db.rollback()
+        raise
 
     return {
         "message": "Account created",
@@ -204,9 +235,18 @@ def register(
 
 @app.post("/auth/login")
 def login(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
+    enforce_rate_limit(
+        db, request, "login",
+        identity=form_data.username,
+        ip_limit=30,
+        identity_limit=10,
+        window_seconds=900,
+    )
+
     user = authenticate_user(
         db,
         form_data.username,
@@ -439,26 +479,17 @@ def delete_campaign(
 # ============================================================
 
 class SpendRequest(BaseModel):
-    amount: float = Field(gt=0)
+    amount: float = Field(gt=0, allow_inf_nan=False)
     platform: str = "unknown"
     country: Optional[str] = None
     spending_type: str = "normal"
 
-
-def reset_daily_and_monthly_counters(
-    campaign: CampaignDB,
-):
-    today = date.today()
-
-    if campaign.spending_date != today:
-        campaign.spent_today = 0
-        campaign.spending_date = today
-
-    current_month = today.month
-
-    if campaign.spending_month != current_month:
-        campaign.spent_this_month = 0
-        campaign.spending_month = current_month
+    @field_validator("amount", mode="before")
+    @classmethod
+    def reject_boolean_amount(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Spend amount must be a number, not a boolean.")
+        return value
 
 
 @app.post("/campaigns/{campaign_id}/spend")
@@ -483,78 +514,27 @@ def record_spend(
             detail="Campaign not found",
         )
 
-    reset_daily_and_monthly_counters(campaign)
-
-    # Monthly pacing target.
-    today = date.today()
-    days_in_month = 30
-
-    daily_limit = (
-        campaign.monthly_budget
-        / days_in_month
-    )
-
-    if data.spending_type == "normal":
-
-        if (
-            campaign.spent_today + data.amount
-            > daily_limit
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Daily budget limit exceeded",
-            )
-
-        if (
-            campaign.spent_this_month + data.amount
-            > campaign.monthly_budget
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Monthly budget limit exceeded",
-            )
-
-        campaign.spent_today += data.amount
-        campaign.spent_this_month += data.amount
-
-    elif data.spending_type == "discovery":
-
-        available = (
-            campaign.discovery_budget
-            - campaign.discovery_spent
+    try:
+        transaction = safety_record_spend(
+            db=db,
+            campaign=campaign,
+            amount=data.amount,
+            platform=data.platform,
+            country=data.country,
+            spending_type=data.spending_type,
         )
-
-        if data.amount > available:
-            raise HTTPException(
-                status_code=400,
-                detail="Discovery budget exceeded",
-            )
-
-        campaign.discovery_spent += data.amount
-
-    else:
+    except ValueError as error:
         raise HTTPException(
             status_code=400,
-            detail="Invalid spending type",
+            detail=str(error),
         )
 
-    transaction = SpendingTransactionDB(
-        campaign_id=campaign.id,
-        amount=data.amount,
-        platform=data.platform,
-        country=data.country,
-        spending_type=data.spending_type,
-    )
-
-    db.add(transaction)
-    db.commit()
-    db.refresh(transaction)
-
     return {
-        "message": "Spend recorded",
+        "message": "Spend approved and recorded",
         "transaction_id": transaction.id,
-        "amount": data.amount,
-        "spending_type": data.spending_type,
+        "amount": transaction.amount,
+        "spending_type": transaction.spending_type,
+        "safety": get_safety_summary(campaign),
     }
 
 
@@ -579,7 +559,8 @@ def get_budget(
             detail="Campaign not found",
         )
 
-    reset_daily_and_monthly_counters(campaign)
+    reset_daily_if_needed(campaign)
+    reset_monthly_if_needed(campaign)
 
     db.commit()
 
@@ -629,62 +610,101 @@ def create_experiment(
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    campaign = (
-        db.query(CampaignDB)
-        .filter(
-            CampaignDB.id == campaign_id,
-            CampaignDB.user_id == current_user.id,
+    try:
+        dialect = db.get_bind().dialect.name
+
+        if dialect == "sqlite":
+            # Acquire the SQLite write lock before reading reservations.
+            lock_result = db.execute(
+                update(CampaignDB)
+                .where(
+                    CampaignDB.id == campaign_id,
+                    CampaignDB.user_id == current_user.id,
+                )
+                .values(id=CampaignDB.id)
+                .execution_options(synchronize_session=False)
+            )
+
+            if lock_result.rowcount != 1:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Campaign not found",
+                )
+
+            campaign = (
+                db.query(CampaignDB)
+                .filter(
+                    CampaignDB.id == campaign_id,
+                    CampaignDB.user_id == current_user.id,
+                )
+                .populate_existing()
+                .first()
+            )
+
+        else:
+            # Lock the campaign row before calculating reserved budget.
+            campaign = (
+                db.query(CampaignDB)
+                .filter(
+                    CampaignDB.id == campaign_id,
+                    CampaignDB.user_id == current_user.id,
+                )
+                .with_for_update()
+                .populate_existing()
+                .first()
+            )
+
+        if not campaign:
+            raise HTTPException(
+                status_code=404,
+                detail="Campaign not found",
+            )
+
+        reserved = (
+            db.query(ExperimentDB)
+            .filter(
+                ExperimentDB.campaign_id == campaign.id,
+                ExperimentDB.status == "planned",
+            )
+            .all()
         )
-        .first()
-    )
 
-    if not campaign:
-        raise HTTPException(
-            status_code=404,
-            detail="Campaign not found",
+        reserved_budget = sum(
+            experiment.budget
+            for experiment in reserved
         )
 
-    reserved = (
-        db.query(ExperimentDB)
-        .filter(
-            ExperimentDB.campaign_id == campaign.id,
-            ExperimentDB.status == "planned",
-        )
-        .all()
-    )
-
-    reserved_budget = sum(
-        experiment.budget
-        for experiment in reserved
-    )
-
-    available = (
-        campaign.discovery_budget
-        - campaign.discovery_spent
-        - reserved_budget
-    )
-
-    if data.budget > available:
-        raise HTTPException(
-            status_code=400,
-            detail="Not enough discovery budget available",
+        available = (
+            campaign.discovery_budget
+            - campaign.discovery_spent
+            - reserved_budget
         )
 
-    experiment = ExperimentDB(
-        campaign_id=campaign.id,
-        name=data.name,
-        experiment_type=data.experiment_type,
-        target=data.target,
-        platform=data.platform,
-        budget=data.budget,
-        status="planned",
-    )
+        if data.budget > available:
+            raise HTTPException(
+                status_code=400,
+                detail="Not enough discovery budget available",
+            )
 
-    db.add(experiment)
-    db.commit()
-    db.refresh(experiment)
+        experiment = ExperimentDB(
+            campaign_id=campaign.id,
+            name=data.name,
+            experiment_type=data.experiment_type,
+            target=data.target,
+            platform=data.platform,
+            budget=data.budget,
+            status="planned",
+        )
 
-    return experiment
+        db.add(experiment)
+        db.commit()
+        db.refresh(experiment)
+
+        return experiment
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.get("/campaigns/{campaign_id}/experiments")
@@ -724,6 +744,7 @@ def complete_experiment(
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # First verify ownership and obtain the campaign ID.
     experiment = (
         db.query(ExperimentDB)
         .join(
@@ -743,20 +764,92 @@ def complete_experiment(
             detail="Experiment not found",
         )
 
-    if result.spent > experiment.budget:
-        raise HTTPException(
-            status_code=400,
-            detail="Experiment spent exceeds experiment budget",
+    try:
+        campaign_id = experiment.campaign_id
+        dialect = db.get_bind().dialect.name
+
+        if dialect == "sqlite":
+            # Acquire SQLite's write lock before checking experiment status.
+            lock_result = db.execute(
+                update(CampaignDB)
+                .where(
+                    CampaignDB.id == campaign_id,
+                    CampaignDB.user_id == current_user.id,
+                )
+                .values(id=CampaignDB.id)
+                .execution_options(synchronize_session=False)
+            )
+
+            if lock_result.rowcount != 1:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Campaign not found",
+                )
+
+        else:
+            # Serialize experiment updates through the campaign row.
+            locked_campaign = (
+                db.query(CampaignDB)
+                .filter(
+                    CampaignDB.id == campaign_id,
+                    CampaignDB.user_id == current_user.id,
+                )
+                .with_for_update()
+                .populate_existing()
+                .first()
+            )
+
+            if locked_campaign is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Campaign not found",
+                )
+
+        # Re-read after acquiring the lock to avoid stale status.
+        experiment = (
+            db.query(ExperimentDB)
+            .join(
+                CampaignDB,
+                ExperimentDB.campaign_id == CampaignDB.id,
+            )
+            .filter(
+                ExperimentDB.id == experiment_id,
+                CampaignDB.user_id == current_user.id,
+            )
+            .populate_existing()
+            .first()
         )
 
-    experiment.spent = result.spent
-    experiment.clicks = result.clicks
-    experiment.conversions = result.conversions
-    experiment.revenue = result.revenue
-    experiment.status = "completed"
-    experiment.completed_at = datetime.utcnow()
+        if not experiment:
+            raise HTTPException(
+                status_code=404,
+                detail="Experiment not found",
+            )
 
-    db.commit()
+        if experiment.status != "planned":
+            raise HTTPException(
+                status_code=409,
+                detail="Experiment has already been completed or is not planned.",
+            )
+
+        if result.spent > experiment.budget:
+            raise HTTPException(
+                status_code=400,
+                detail="Experiment spent exceeds experiment budget",
+            )
+
+        experiment.spent = result.spent
+        experiment.clicks = result.clicks
+        experiment.conversions = result.conversions
+        experiment.revenue = result.revenue
+        experiment.status = "completed"
+        experiment.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
 
     return {
         "message": "Experiment completed",
@@ -1189,7 +1282,7 @@ def redeem_discount(
 
     if (
         discount.expires_at
-        and datetime.utcnow() > discount.expires_at
+        and datetime.now(timezone.utc).replace(tzinfo=None) > discount.expires_at
     ):
         raise HTTPException(
             status_code=400,

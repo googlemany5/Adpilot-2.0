@@ -117,12 +117,38 @@ class BudgetController:
         allocation: dict[str, Any],
     ):
 
-        requested_amount = float(
-            allocation.get(
-                "budget",
-                0,
-            )
+        raw_amount = allocation.get("budget", 0)
+
+        spending_type = allocation.get(
+            "spending_type",
+            "normal",
         )
+
+        try:
+            requested_amount = float(raw_amount)
+        except (TypeError, ValueError, OverflowError):
+            return {
+                "campaign_id": self.campaign.id,
+                "platform": allocation.get("platform", "unknown"),
+                "requested_budget": None,
+                "approved_budget": 0.0,
+                "approved": False,
+                "reason": "Spend amount must be a finite number.",
+                "spending_type": spending_type,
+                "platform_execution": False,
+            }
+
+        if not math.isfinite(requested_amount):
+            return {
+                "campaign_id": self.campaign.id,
+                "platform": allocation.get("platform", "unknown"),
+                "requested_budget": None,
+                "approved_budget": 0.0,
+                "approved": False,
+                "reason": "Spend amount must be a finite number.",
+                "spending_type": spending_type,
+                "platform_execution": False,
+            }
 
         spending_type = allocation.get(
             "spending_type",

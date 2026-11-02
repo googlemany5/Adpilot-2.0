@@ -24,6 +24,7 @@ def fake_campaign(
         discovery_spent=discovery_spent,
         spending_date=today,
         spending_month=today.month,
+            spending_year=today.year,
     )
 
 
@@ -75,6 +76,22 @@ tests = [
         "normal",
         False,
         "Spend amount must be greater than zero.",
+    ),
+    (
+        "True boolean spending rejected",
+        fake_campaign(),
+        True,
+        "normal",
+        False,
+        "Spend amount must be a finite number.",
+    ),
+    (
+        "False boolean spending rejected",
+        fake_campaign(),
+        False,
+        "normal",
+        False,
+        "Spend amount must be a finite number.",
     ),
     (
         "NaN spending rejected",

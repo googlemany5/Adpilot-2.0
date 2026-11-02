@@ -1,6 +1,8 @@
 from datetime import date, datetime
 import math
 
+from sqlalchemy import update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from database import CampaignDB, SpendingTransactionDB
@@ -30,10 +32,17 @@ def reset_daily_if_needed(campaign: CampaignDB):
 
 
 def reset_monthly_if_needed(campaign: CampaignDB):
-    current_month = date.today().month
+    today = date.today()
+    current_month = today.month
+    current_year = today.year
 
-    if campaign.spending_month != current_month:
+    if (
+        campaign.spending_month != current_month
+        or getattr(campaign, "spending_year", current_year)
+        != current_year
+    ):
         campaign.spending_month = current_month
+        campaign.spending_year = current_year
         campaign.spent_this_month = 0.0
 
 
@@ -115,7 +124,8 @@ def validate_spend(
     """
 
     if (
-        not isinstance(amount, (int, float))
+        isinstance(amount, bool)
+        or not isinstance(amount, (int, float))
         or not math.isfinite(amount)
     ):
         return False, "Spend amount must be a finite number."
@@ -224,48 +234,89 @@ def record_spend(
     spending_type: str = "normal",
 ):
     """
-    Safety-controlled spending recorder.
+    Atomically validates and records an approved spending decision.
 
-    IMPORTANT:
-    This does NOT directly spend money on an ad platform.
-
-    It records an approved spending decision.
-
-    Real Google/Meta execution will eventually happen through
-    a separate platform execution layer.
+    This records a decision only. It does not spend money on an
+    external advertising platform.
     """
 
-    approved, reason = validate_spend(
-        campaign=campaign,
-        amount=amount,
-        spending_type=spending_type,
-    )
+    try:
+        campaign_id = campaign.id
+        dialect = db.get_bind().dialect.name
 
-    if not approved:
-        raise ValueError(reason)
+        if dialect == "sqlite":
+            # Acquire SQLite's write lock before reading budget counters.
+            result = db.execute(
+                update(CampaignDB)
+                .where(CampaignDB.id == campaign_id)
+                .values(id=CampaignDB.id)
+                .execution_options(synchronize_session=False)
+            )
 
-    reset_daily_if_needed(campaign)
-    reset_monthly_if_needed(campaign)
+            if result.rowcount != 1:
+                raise ValueError("Campaign was not found.")
 
-    campaign.spent_today += amount
-    campaign.spent_this_month += amount
+            db.refresh(campaign)
 
-    if spending_type == "discovery":
-        campaign.discovery_spent += amount
+        else:
+            # Acquire a row-level lock on databases that support it.
+            locked_campaign = (
+                db.query(CampaignDB)
+                .filter(CampaignDB.id == campaign_id)
+                .with_for_update()
+                .populate_existing()
+                .first()
+            )
 
-    transaction = SpendingTransactionDB(
-        campaign_id=campaign.id,
-        amount=amount,
-        platform=platform,
-        country=country,
-        spending_type=spending_type,
-    )
+            if locked_campaign is None:
+                raise ValueError("Campaign was not found.")
 
-    db.add(transaction)
-    db.commit()
-    db.refresh(campaign)
+            campaign = locked_campaign
 
-    return transaction
+        # Refresh budget periods before validating the allocation.
+        reset_daily_if_needed(campaign)
+        reset_monthly_if_needed(campaign)
+
+        approved, reason = validate_spend(
+            campaign=campaign,
+            amount=amount,
+            spending_type=spending_type,
+        )
+
+        if not approved:
+            raise ValueError(reason)
+
+        campaign.spent_today += amount
+        campaign.spent_this_month += amount
+
+        if spending_type == "discovery":
+            campaign.discovery_spent += amount
+
+        transaction = SpendingTransactionDB(
+            campaign_id=campaign.id,
+            amount=amount,
+            platform=platform,
+            country=country,
+            spending_type=spending_type,
+        )
+
+        db.add(transaction)
+        db.commit()
+        db.refresh(campaign)
+        db.refresh(transaction)
+
+        return transaction
+
+    except OperationalError as exc:
+        db.rollback()
+        raise ValueError(
+            "Spending could not safely acquire the database lock. "
+            "Please retry the request."
+        ) from exc
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 # ============================================================

@@ -31,6 +31,73 @@ export default function FeatureWorkspace({ page, campaigns, isAdmin }: Props) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [refresh, setRefresh] = useState(0);
+  const [connectingPlatform, setConnectingPlatform] = useState<"google" | "meta" | null>(null);
+  const [connectionMessage, setConnectionMessage] = useState("");
+  const [connectionError, setConnectionError] = useState("");
+
+  async function connectPlatform(platform: "google" | "meta") {
+    setConnectingPlatform(platform);
+    setConnectionMessage("");
+    setConnectionError("");
+
+    try {
+      const token = localStorage.getItem("adpilot_token");
+      if (!token) {
+        throw new Error("Your session is missing. Please sign in again.");
+      }
+
+      const response = await fetch(`${API}/platform-oauth/${platform}/start`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      const body = await response.text();
+      let result: unknown;
+      try {
+        result = body ? JSON.parse(body) : null;
+      } catch {
+        result = null;
+      }
+
+      if (!response.ok) {
+        const detail =
+          typeof result === "object" && result !== null && "detail" in result
+            ? String((result as { detail: unknown }).detail)
+            : `Could not start authorization (${response.status}).`;
+        throw new Error(detail);
+      }
+
+      const authorizationUrl =
+        typeof result === "object" &&
+        result !== null &&
+        "authorization_url" in result &&
+        typeof (result as { authorization_url: unknown }).authorization_url === "string"
+          ? (result as { authorization_url: string }).authorization_url
+          : "";
+
+      if (!authorizationUrl) {
+        throw new Error("The backend did not return an authorization URL.");
+      }
+
+      const parsedUrl = new URL(authorizationUrl);
+      const expectedOrigin =
+        platform === "google"
+          ? "https://accounts.google.com"
+          : "https://www.facebook.com";
+
+      if (parsedUrl.protocol !== "https:" || parsedUrl.origin !== expectedOrigin) {
+        throw new Error("The backend returned an unexpected authorization URL.");
+      }
+
+      setConnectionMessage(`Opening ${platform === "google" ? "Google Ads" : "Meta Ads"} authorization…`);
+      window.location.assign(parsedUrl.toString());
+    } catch (error) {
+      setConnectionError(
+        error instanceof Error ? error.message : "Could not start platform authorization.",
+      );
+      setConnectingPlatform(null);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -142,6 +209,45 @@ export default function FeatureWorkspace({ page, campaigns, isAdmin }: Props) {
           </button>
         </div>
       </div>
+
+      {page === "Connections" && (
+        <section className="rounded-2xl border border-white/[0.09] bg-gradient-to-br from-[#111b2e] to-[#0d1424] p-5 shadow-xl shadow-black/10 sm:p-6">
+          <h3 className="text-lg font-semibold text-white">Connect an advertising platform</h3>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-400">
+            Authorize AdPilot to request access to your advertising account. Connecting does not
+            activate the connection or launch ads. You will still need to select an ad account
+            before activation.
+          </p>
+
+          <div className="mt-5 flex flex-wrap gap-3">
+            <button
+              type="button"
+              disabled={connectingPlatform !== null}
+              onClick={() => void connectPlatform("google")}
+              className="rounded-xl bg-blue-500 px-4 py-3 text-sm font-semibold text-white hover:bg-blue-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {connectingPlatform === "google" ? "Opening Google…" : "Connect Google Ads"}
+            </button>
+            <button
+              type="button"
+              disabled={connectingPlatform !== null}
+              onClick={() => void connectPlatform("meta")}
+              className="rounded-xl bg-indigo-500 px-4 py-3 text-sm font-semibold text-white hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {connectingPlatform === "meta" ? "Opening Meta…" : "Connect Meta Ads"}
+            </button>
+          </div>
+
+          {connectionMessage && (
+            <p role="status" className="mt-4 text-sm text-blue-200">{connectionMessage}</p>
+          )}
+          {connectionError && (
+            <p role="alert" className="mt-4 rounded-lg border border-rose-400/20 bg-rose-400/[0.06] p-3 text-sm text-rose-200">
+              {connectionError}
+            </p>
+          )}
+        </section>
+      )}
 
       {page === "AI Optimizer" && (
         <div className="rounded-xl border border-amber-400/20 bg-amber-400/[0.06] p-4 text-sm leading-6 text-amber-100">

@@ -53,6 +53,9 @@ def billing_setup(monkeypatch):
     app.dependency_overrides[get_db] = override_get_db
     monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_fake")
+    monkeypatch.setenv("STRIPE_STARTER_PRICE_ID", "price_starter_test")
+    monkeypatch.setenv("STRIPE_PRO_PRICE_ID", "price_pro_test")
+    monkeypatch.setenv("STRIPE_BUSINESS_PRICE_ID", "price_business_test")
 
     # Checkout reconciliation uses a deterministic fake Stripe response.
     monkeypatch.setattr(
@@ -62,6 +65,7 @@ def billing_setup(monkeypatch):
             "id": id,
             "customer": "cus_test_123",
             "status": "incomplete",
+            "items": {"data": [{"price": {"id": "price_starter_test"}}]},
             "metadata": {
                 "user_id": str(user.id),
                 "plan": "starter",
@@ -82,6 +86,24 @@ def billing_setup(monkeypatch):
 def send_event(
     monkeypatch, client, event_type, obj, created=1800000000, event_id=None
 ):
+    obj = dict(obj)
+    if (
+        event_type in {
+            "customer.subscription.created",
+            "customer.subscription.updated",
+        }
+        and "items" not in obj
+    ):
+        plan = (obj.get("metadata") or {}).get("plan", "")
+        price_id = {
+            "starter": "price_starter_test",
+            "pro": "price_pro_test",
+            "business": "price_business_test",
+        }.get(plan)
+        obj["items"] = {
+            "data": [{"price": {"id": price_id}}] if price_id else []
+        }
+
     event = {
         "id": event_id or f"evt_test_{created}_{event_type}",
         "created": created,
@@ -183,7 +205,7 @@ def test_deleted_subscription_removes_paid_access(
     assert subscription.status == "pending"
 
 
-def test_failed_payment_removes_paid_access(
+def test_failed_payment_preserves_access_during_retry_period(
     billing_setup, monkeypatch
 ):
     client, db, user, subscription = billing_setup
@@ -199,7 +221,76 @@ def test_failed_payment_removes_paid_access(
 
     assert response.status_code == 200
     db.refresh(subscription)
+    assert subscription.status == "active"
+
+
+def test_subscription_with_wrong_stripe_price_cannot_activate_access(
+    billing_setup, monkeypatch
+):
+    client, db, user, subscription = billing_setup
+
+    response = send_event(
+        monkeypatch,
+        client,
+        "customer.subscription.updated",
+        {
+            "id": "sub_test_123",
+            "customer": "cus_test_123",
+            "status": "active",
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+            "items": {"data": [{"price": {"id": "price_business_test"}}]},
+        },
+    )
+
+    assert response.status_code == 200
+    db.refresh(subscription)
     assert subscription.status == "pending"
+
+
+def test_checkout_with_wrong_stripe_price_cannot_attach_subscription(
+    billing_setup, monkeypatch
+):
+    client, db, user, subscription = billing_setup
+
+    monkeypatch.setattr(
+        stripe.Subscription,
+        "retrieve",
+        lambda id, **kwargs: {
+            "id": id,
+            "customer": "cus_test_123",
+            "status": "active",
+            "items": {"data": [{"price": {"id": "price_business_test"}}]},
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+    )
+
+    response = send_event(
+        monkeypatch,
+        client,
+        "checkout.session.completed",
+        {
+            "id": "cs_wrong_price",
+            "customer": "cus_test_123",
+            "subscription": "sub_wrong_price",
+            "client_reference_id": str(user.id),
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+        created=1800000500,
+    )
+
+    assert response.status_code == 200
+    db.refresh(subscription)
+    assert subscription.status == "pending"
+    assert subscription.stripe_subscription_id == "sub_test_123"
 
 
 def test_checkout_completion_does_not_activate_new_subscription(
@@ -260,7 +351,7 @@ def test_repeated_checkout_event_does_not_duplicate_subscription(
     assert subscription.stripe_subscription_id == "sub_new_456"
 
 
-def test_stale_active_event_does_not_restore_access_after_failed_payment(
+def test_stale_subscription_event_does_not_overwrite_newer_payment_failure(
     billing_setup, monkeypatch
 ):
     client, db, user, subscription = billing_setup
@@ -278,7 +369,7 @@ def test_stale_active_event_does_not_restore_access_after_failed_payment(
     assert failed_payment.status_code == 200
 
     db.refresh(subscription)
-    assert subscription.status == "pending"
+    assert subscription.status == "active"
 
     # Then an older "active" update arrives late.
     stale_active_update = send_event(
@@ -300,37 +391,44 @@ def test_stale_active_event_does_not_restore_access_after_failed_payment(
 
     db.refresh(subscription)
 
-    # A stale event must not restore paid access.
-    assert subscription.status == "pending"
+    # A stale event must not overwrite the newer payment event.
+    assert subscription.status == "active"
 
 
-
-def test_newer_active_event_can_restore_access_after_failed_payment(
+def test_past_due_keeps_access_and_unpaid_revokes_it(
     billing_setup, monkeypatch
 ):
     client, db, user, subscription = billing_setup
     subscription.status = "active"
     db.commit()
 
-    failed_payment = send_event(
-        monkeypatch,
-        client,
-        "invoice.payment_failed",
-        {"subscription": "sub_test_123"},
-        created=200,
-    )
-    assert failed_payment.status_code == 200
-    db.refresh(subscription)
-    assert subscription.status == "pending"
-
-    newer_active_update = send_event(
+    past_due = send_event(
         monkeypatch,
         client,
         "customer.subscription.updated",
         {
             "id": "sub_test_123",
             "customer": "cus_test_123",
-            "status": "active",
+            "status": "past_due",
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+        created=200,
+    )
+    assert past_due.status_code == 200
+    db.refresh(subscription)
+    assert subscription.status == "active"
+
+    unpaid = send_event(
+        monkeypatch,
+        client,
+        "customer.subscription.updated",
+        {
+            "id": "sub_test_123",
+            "customer": "cus_test_123",
+            "status": "unpaid",
             "metadata": {
                 "user_id": str(user.id),
                 "plan": "starter",
@@ -338,10 +436,29 @@ def test_newer_active_event_can_restore_access_after_failed_payment(
         },
         created=300,
     )
-    assert newer_active_update.status_code == 200
+    assert unpaid.status_code == 200
     db.refresh(subscription)
-    assert subscription.status == "active"
-    assert subscription.last_stripe_event_created == 300
+    assert subscription.status == "pending"
+
+    # A late past_due event must not restore access after unpaid.
+    stale_past_due = send_event(
+        monkeypatch,
+        client,
+        "customer.subscription.updated",
+        {
+            "id": "sub_test_123",
+            "customer": "cus_test_123",
+            "status": "past_due",
+            "metadata": {
+                "user_id": str(user.id),
+                "plan": "starter",
+            },
+        },
+        created=250,
+    )
+    assert stale_past_due.status_code == 200
+    db.refresh(subscription)
+    assert subscription.status == "pending"
 
 
 def test_unknown_subscription_id_does_not_fall_back_to_customer_or_user(
@@ -641,6 +758,7 @@ def test_out_of_order_subscription_event_reconciles_current_stripe_status(
             "id": id,
             "customer": "cus_test_123",
             "status": "active",
+            "items": {"data": [{"price": {"id": "price_starter_test"}}]},
             "metadata": {
                 "user_id": str(user.id),
                 "plan": "starter",

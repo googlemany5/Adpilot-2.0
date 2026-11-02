@@ -1,261 +1,67 @@
-import requests
-import json
-import sys
+"""Safe API smoke tests. Requires a running local API server."""
+
 import os
+import uuid
 
-BASE = "http://127.0.0.1:8000"
+import pytest
+import requests
 
-EMAIL = "test@adpilot.ai"
-PASSWORD = os.environ.get("ADPILOT_TEST_PASSWORD")
-
-if not PASSWORD:
-    raise SystemExit(
-        "Set ADPILOT_TEST_PASSWORD before running this test."
-    )
+BASE = os.getenv("ADPILOT_TEST_BASE_URL", "http://127.0.0.1:8000")
+PASSWORD = os.getenv("ADPILOT_TEST_PASSWORD")
 
 
-def show(name, response):
-    print(f"\n{'='*60}")
-    print(name)
-    print(f"STATUS: {response.status_code}")
-    try:
-        data = response.json()
-        print(json.dumps(data, indent=2))
-        return data
-    except:
-        print(response.text)
-        return None
+def test_health_endpoint():
+    response = requests.get(f"{BASE}/health", timeout=10)
+    assert response.status_code == 200, response.text
 
-# Health
-r = requests.get(f"{BASE}/health")
-show("HEALTH", r)
 
-# Register
-r = requests.post(
-    f"{BASE}/auth/register",
-    json={
-        "email": EMAIL,
-        "password": PASSWORD,
-        "first_name": "Test",
-        "last_name": "User",
-    },
-)
-show("REGISTER", r)
+def test_registration_login_and_current_user():
+    if not PASSWORD:
+        pytest.fail("Set ADPILOT_TEST_PASSWORD before running this test.")
 
-# Login
-r = requests.post(
-    f"{BASE}/auth/login",
-    data={
-        "username": EMAIL,
-        "password": PASSWORD,
-    },
-)
-login = show("LOGIN", r)
+    email = f"smoke-{uuid.uuid4().hex}@adpilot.ai"
 
-if r.status_code != 200:
-    print("\nLOGIN FAILED - stopping test.")
-    sys.exit(1)
-
-token = login["access_token"]
-headers = {"Authorization": f"Bearer {token}"}
-
-# Current user
-r = requests.get(f"{BASE}/auth/me", headers=headers)
-show("AUTH ME", r)
-
-# Create campaign
-r = requests.post(
-    f"{BASE}/campaigns",
-    headers=headers,
-    json={
-        "name": "Test Campaign",
-        "monthly_budget": 3000,
-        "discovery_budget": 500,
-        "country": "United States",
-    },
-)
-campaign = show("CREATE CAMPAIGN", r)
-
-if r.status_code not in (200, 201):
-    print("\nCAMPAIGN CREATION FAILED - stopping test.")
-    sys.exit(1)
-
-campaign_id = campaign["id"]
-
-# Get campaigns
-r = requests.get(f"{BASE}/campaigns", headers=headers)
-show("LIST CAMPAIGNS", r)
-
-# Get campaign
-r = requests.get(
-    f"{BASE}/campaigns/{campaign_id}",
-    headers=headers,
-)
-show("GET CAMPAIGN", r)
-
-# Budget
-r = requests.get(
-    f"{BASE}/campaigns/{campaign_id}/budget",
-    headers=headers,
-)
-show("CAMPAIGN BUDGET", r)
-
-# Safety
-r = requests.get(
-    f"{BASE}/campaigns/{campaign_id}/safety",
-    headers=headers,
-)
-show("SAFETY SUMMARY", r)
-
-# Create experiment
-r = requests.post(
-    f"{BASE}/campaigns/{campaign_id}/experiments",
-    headers=headers,
-    json={
-        "name": "US Market Test",
-        "experiment_type": "country",
-        "target": "United States",
-        "platform": "meta",
-        "budget": 100,
-    },
-)
-experiment = show("CREATE EXPERIMENT", r)
-
-if r.status_code in (200, 201):
-    experiment_id = experiment["id"]
-
-    # Experiment result
-    r = requests.post(
-        f"{BASE}/experiments/{experiment_id}/result",
-        headers=headers,
+    # Register a fresh test user to avoid relying on an old account.
+    register = requests.post(
+        f"{BASE}/auth/register",
         json={
-            "spent": 75,
-            "clicks": 50,
-            "conversions": 5,
-            "revenue": 300,
+            "email": email,
+            "password": PASSWORD,
+            "first_name": "Smoke",
+            "last_name": "Test",
         },
+        timeout=10,
     )
-    show("EXPERIMENT RESULT", r)
+    assert register.status_code in (200, 201), (
+        f"Registration failed: {register.status_code} {register.text}"
+    )
 
-# Optimizer
-r = requests.get(
-    f"{BASE}/campaigns/{campaign_id}/optimization",
-    headers=headers,
-)
-show("OPTIMIZATION", r)
+    # Verify login with the newly registered account.
+    login = requests.post(
+        f"{BASE}/auth/login",
+        data={"username": email, "password": PASSWORD},
+        timeout=10,
+    )
+    assert login.status_code == 200, (
+        f"Login failed: {login.status_code} {login.text}"
+    )
 
-# Safe spend
-r = requests.post(
-    f"{BASE}/campaigns/{campaign_id}/safe-spend",
-    headers=headers,
-    params={
-        "amount": 25,
-        "platform": "meta",
-        "country": "United States",
-        "spending_type": "normal",
-    },
-)
-show("SAFE SPEND", r)
+    token = login.json().get("access_token")
+    assert token, "Login response did not contain an access token."
 
-# Safety again
-r = requests.get(
-    f"{BASE}/campaigns/{campaign_id}/safety",
-    headers=headers,
-)
-show("SAFETY AFTER SPEND", r)
+    # Verify the token authenticates the user.
+    me = requests.get(
+        f"{BASE}/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    assert me.status_code == 200, (
+        f"Authenticated user check failed: {me.status_code} {me.text}"
+    )
 
-# Pause
-r = requests.post(
-    f"{BASE}/campaigns/{campaign_id}/pause",
-    headers=headers,
-)
-show("PAUSE CAMPAIGN", r)
+    user = me.json()
+    assert user.get("email", "").lower() == email.lower()
 
-# Resume
-r = requests.post(
-    f"{BASE}/campaigns/{campaign_id}/resume",
-    headers=headers,
-)
-show("RESUME CAMPAIGN", r)
 
-# Safe spend after resume: should succeed only if campaign is active
-r = requests.post(
-    f"{BASE}/campaigns/{campaign_id}/safe-spend",
-    headers=headers,
-    params={
-        "amount": 25,
-        "platform": "meta",
-        "country": "United States",
-        "spending_type": "normal",
-    },
-)
-show("SAFE SPEND AFTER RESUME", r)
-
-# Verify recorded spending after the successful attempt
-r = requests.get(
-    f"{BASE}/campaigns/{campaign_id}/safety",
-    headers=headers,
-)
-show("SAFETY AFTER ACTIVE SPEND", r)
-
-# Platform status
-r = requests.get(
-    f"{BASE}/platforms/status",
-    headers=headers,
-)
-show("PLATFORM STATUS", r)
-
-# AI pipeline / Shadow Mode
-r = requests.post(
-    f"{BASE}/campaigns/{campaign_id}/run-ai",
-    headers=headers,
-)
-show("AI PIPELINE / SHADOW MODE", r)
-
-# Shadow decisions
-r = requests.get(
-    f"{BASE}/campaigns/{campaign_id}/shadow-decisions",
-    headers=headers,
-)
-show("SHADOW DECISIONS", r)
-
-# ML training
-r = requests.post(
-    f"{BASE}/ml/train",
-    headers=headers,
-    json=[
-        {
-            "spend": 100,
-            "impressions": 5000,
-            "clicks": 100,
-            "conversions": 5,
-            "revenue": 300,
-        },
-        {
-            "spend": 150,
-            "impressions": 7000,
-            "clicks": 140,
-            "conversions": 8,
-            "revenue": 500,
-        },
-        {
-            "spend": 200,
-            "impressions": 9000,
-            "clicks": 180,
-            "conversions": 11,
-            "revenue": 700,
-        },
-    ],
-)
-show("ML TRAIN", r)
-
-# Emergency pause
-r = requests.post(
-    f"{BASE}/campaigns/{campaign_id}/emergency-pause",
-    headers=headers,
-)
-show("EMERGENCY PAUSE", r)
-
-print(f"\n{'='*60}")
-print("ADPILOT BACKEND TEST FINISHED")
-print(f"{'='*60}")
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

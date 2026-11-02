@@ -24,3 +24,20 @@ venv/
 # Test and tool caches
 .pytest_cache/
 .mypy_cache/
+
+# Local recovery snapshots and backup directories
+*.bak
+*.bak.*
+*.backup
+*.backup_*
+*backup*/
+
+# All local backup files
+*backup*
+
+# Historical source snapshots and generated reports
+*.before_*
+*-before-*
+backend/backend_audit_*.txt
+backend/warning_report.txt
+/d

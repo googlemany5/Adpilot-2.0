@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 
@@ -563,7 +563,7 @@ def run_optimization_pipeline(
 
     return {
         "generated_at":
-            datetime.utcnow(),
+            datetime.now(timezone.utc).replace(tzinfo=None),
 
         "ranked_experiments":
             ranked,

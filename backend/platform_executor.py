@@ -146,11 +146,9 @@ class PlatformExecutor:
             "unknown",
         )
 
-        requested_budget = float(
-            allocation.get(
-                "budget",
-                0,
-            )
+        requested_budget = allocation.get(
+            "budget",
+            0,
         )
 
         platform_status = self.check_platform(

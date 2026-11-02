@@ -36,6 +36,23 @@ def _price_ids():
     }
 
 
+
+def _subscription_price_matches_plan(provider_subscription, plan):
+    """Require exactly one Stripe subscription item matching the configured plan."""
+    expected_price_id = _price_ids().get(plan)
+    if not expected_price_id:
+        return False
+
+    items = provider_subscription.get("items") or {}
+    data = items.get("data") or []
+    if len(data) != 1:
+        return False
+
+    price = data[0].get("price") or {}
+    actual_price_id = price.get("id") if isinstance(price, dict) else price
+    return actual_price_id == expected_price_id
+
+
 def _find_subscription(db, customer_id=None, subscription_id=None, user_id=None):
     query = db.query(SubscriptionDB)
 
@@ -322,6 +339,9 @@ async def stripe_webhook(
                     )
                     or str(provider_user_id or "") != str(user_id)
                     or provider_plan != plan
+                    or not _subscription_price_matches_plan(
+                        provider_subscription, plan
+                    )
                 ):
                     db.commit()
                     return {"received": True}
@@ -336,7 +356,7 @@ async def stripe_webhook(
 
             # Checkout completion is not itself proof of paid access.
             # Only the verified current Stripe subscription status can activate.
-            if verified_status in {"active", "trialing"}:
+            if verified_status in {"active", "trialing", "past_due"}:
                 subscription.status = "active"
             else:
                 subscription.status = "pending"
@@ -393,7 +413,12 @@ async def stripe_webhook(
                 db.commit()
                 return {"received": True}
 
-            if plan in PAID_PLAN_CAMPAIGN_LIMITS:
+            price_matches_plan = (
+                event_type == "customer.subscription.deleted"
+                or _subscription_price_matches_plan(obj, plan)
+            )
+
+            if plan in PAID_PLAN_CAMPAIGN_LIMITS and price_matches_plan:
                 subscription.plan = plan
 
             if customer_id:
@@ -404,8 +429,9 @@ async def stripe_webhook(
             provider_status = obj.get("status", "")
             if (
                 event_type != "customer.subscription.deleted"
-                and provider_status in {"active", "trialing"}
+                and provider_status in {"active", "trialing", "past_due"}
                 and subscription.plan in PAID_PLAN_CAMPAIGN_LIMITS
+                and price_matches_plan
             ):
                 subscription.status = "active"
             else:
@@ -427,7 +453,8 @@ async def stripe_webhook(
                 db.commit()
                 return {"received": True}
 
-            subscription.status = "pending"
+            # Stripe may retry the payment. Keep the existing access state;
+            # subscription.updated will revoke access if Stripe moves to unpaid.
             _record_stripe_event(subscription, event_created)
             db.commit()
 
