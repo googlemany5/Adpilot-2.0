@@ -200,15 +200,14 @@ def discover_markets(
     max_markets: int = 3,
 ) -> dict:
     """Rank markets and return a shortlist for the experiment engine."""
-    if not isinstance(max_markets, int) or max_markets < 1:
+    if not isinstance(campaign, dict):
+        raise ValueError("campaign must be a dictionary.")
+    if not isinstance(max_markets, int) or isinstance(max_markets, bool) or max_markets < 1:
         raise ValueError("max_markets must be a positive integer.")
 
     month = campaign.get("month", 1)
-    if not isinstance(month, int) or not 1 <= month <= 12:
+    if not isinstance(month, int) or isinstance(month, bool) or not 1 <= month <= 12:
         raise ValueError("campaign month must be an integer from 1 to 12.")
-
-    if not isinstance(campaign, dict):
-        raise ValueError("campaign must be a dictionary.")
     if not isinstance(markets, list):
         raise ValueError("markets must be a list of dictionaries.")
 
