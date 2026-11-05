@@ -22,9 +22,12 @@ if _ENVIRONMENT == "production":
     if (
         not _configured_secret
         or _configured_secret == _DEVELOPMENT_SECRET
+        or len(_configured_secret) < 32
+        or _configured_secret != _configured_secret.strip()
     ):
         raise RuntimeError(
-            "Production requires a unique ADPILOT_SECRET_KEY."
+            "Production requires a unique ADPILOT_SECRET_KEY "
+            "with at least 32 characters and no surrounding whitespace."
         )
 
 SECRET_KEY = _configured_secret or _DEVELOPMENT_SECRET
@@ -133,10 +136,18 @@ def get_current_user(
 
         user_id = payload.get("sub")
 
-        if user_id is None:
+        if (
+            not isinstance(user_id, str)
+            or not user_id.isascii()
+            or not user_id.isdecimal()
+            or len(user_id) > 19
+        ):
             raise credentials_exception
 
         user_id = int(user_id)
+
+        if user_id <= 0 or user_id > 9223372036854775807:
+            raise credentials_exception
 
     except (JWTError, ValueError):
         raise credentials_exception

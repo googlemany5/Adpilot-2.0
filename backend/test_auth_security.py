@@ -120,6 +120,53 @@ def test_invalid_jwt_subject_is_rejected(auth_setup):
     assert exc.value.status_code == 401
 
 
+@pytest.mark.parametrize(
+    "invalid_subject",
+    [
+        "0",
+        "-1",
+        "1.5",
+        "9223372036854775808",
+        "１２３",
+        "١٢٣",
+        "",
+        " 1 ",
+    ],
+)
+def test_invalid_string_jwt_subjects_are_rejected(
+    auth_setup,
+    invalid_subject,
+):
+    token = jwt.encode(
+        {
+            "sub": invalid_subject,
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        get_current_user(token=token, db=auth_setup["db"])
+
+    assert exc.value.status_code == 401
+
+
+def test_missing_jwt_subject_is_rejected(auth_setup):
+    token = jwt.encode(
+        {
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        get_current_user(token=token, db=auth_setup["db"])
+
+    assert exc.value.status_code == 401
+
+
 def test_wrong_user_password_fails(auth_setup):
     assert authenticate_user(
         auth_setup["db"],
