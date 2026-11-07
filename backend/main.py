@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / '.env', override=False)
@@ -55,10 +56,17 @@ from account_discovery import router as account_discovery_router
 # APPLICATION
 # ============================================================
 
+_environment = os.getenv(
+    "ADPILOT_ENVIRONMENT", "development"
+).strip().lower()
+
 app = FastAPI(
     title="AdPilot API",
     description="AI advertising optimization platform",
     version="2.0.0",
+    docs_url=None if _environment == "production" else "/docs",
+    redoc_url=None if _environment == "production" else "/redoc",
+    openapi_url=None if _environment == "production" else "/openapi.json",
 )
 
 app.include_router(billing_router)
